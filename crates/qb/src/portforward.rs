@@ -25,8 +25,12 @@ pub enum PortForwardStatus {
     Starting,
     Active,
     Paused,
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     Error(String),
+    /// Credential plugin or token rejection. Not retried.
+    AuthExpired,
     Cancelled,
 }
 
@@ -38,6 +42,7 @@ impl PortForwardStatus {
             | Self::Paused => "Paused",
             | Self::Reconnecting { .. } => "Reconnecting",
             | Self::Error(_) => "Error",
+            | Self::AuthExpired => "Login expired",
             | Self::Cancelled => "Cancelled",
         }
     }
@@ -57,6 +62,38 @@ pub enum PfTarget {
     LabelSelector { selector: String },
 }
 
+impl PfTarget {
+    /// Config stores the variant name and the selector/pod name as two fields.
+    pub fn from_saved(target_type: &str, selector: &str) -> Self {
+        match target_type {
+            | "direct_pod" => {
+                Self::DirectPod {
+                    pod_name: selector.to_string(),
+                }
+            },
+            | _ => {
+                Self::LabelSelector {
+                    selector: selector.to_string(),
+                }
+            },
+        }
+    }
+
+    pub fn saved_parts(&self) -> (&'static str, &str) {
+        match self {
+            | Self::DirectPod { pod_name } => ("direct_pod", pod_name),
+            | Self::LabelSelector { selector } => ("label_selector", selector),
+        }
+    }
+
+    pub fn display_pod(&self) -> &str {
+        match self {
+            | Self::DirectPod { pod_name } => pod_name,
+            | Self::LabelSelector { .. } => "(resolving)",
+        }
+    }
+}
+
 /// Information about one available port on a resource.
 #[derive(Clone, Debug)]
 pub struct PortInfo {
@@ -68,15 +105,75 @@ pub struct PortInfo {
     pub protocol: String,
 }
 
-#[allow(dead_code)]
-pub struct PfResource {
-    pub r#type: String,
-    pub label: String,
-}
-
 pub struct PfPorts {
     pub local: u16,
     pub remote: u16,
+}
+
+/// Who the forward was created from. Name is stored separately from the
+/// display label so port edits don't have to parse "Deployments/name".
+pub struct PfIdentity {
+    pub type_key: String,
+    pub name: String,
+}
+
+impl PfIdentity {
+    pub fn type_label(&self) -> &str {
+        &self.type_key
+    }
+
+    pub fn resource_label(&self) -> String {
+        let display = crate::k8s::ResourceType::from_singular_name(&self.type_key)
+            .map(|rt| rt.display_name())
+            .unwrap_or(self.type_key.as_str());
+        format!("{display}/{}", self.name)
+    }
+}
+
+#[derive(Clone)]
+pub struct PortForwardRequest {
+    pub namespace: String,
+    pub context: String,
+    pub type_key: String,
+    pub resource_name: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub target: PfTarget,
+}
+
+impl PortForwardRequest {
+    pub fn from_saved(saved: &crate::config::SavedPortForward) -> Self {
+        Self {
+            namespace: saved.namespace.clone(),
+            context: saved.context.clone(),
+            type_key: saved.resource.r#type.clone(),
+            resource_name: saved.resource.name.clone(),
+            local_port: saved.port.local_port,
+            remote_port: saved.port.remote_port,
+            target: PfTarget::from_saved(&saved.target.target_type, &saved.target.selector),
+        }
+    }
+
+    pub fn to_saved(&self, paused: bool) -> crate::config::SavedPortForward {
+        let (target_type, selector) = self.target.saved_parts();
+        crate::config::SavedPortForward {
+            resource: crate::config::SavedPfResource {
+                r#type: self.type_key.clone(),
+                name: self.resource_name.clone(),
+            },
+            namespace: self.namespace.clone(),
+            context: self.context.clone(),
+            port: crate::config::SavedPfPorts {
+                local_port: self.local_port,
+                remote_port: self.remote_port,
+            },
+            target: crate::config::SavedPfTarget {
+                target_type: target_type.to_string(),
+                selector: selector.to_string(),
+            },
+            paused,
+        }
+    }
 }
 
 pub struct PortForwardEntry {
@@ -85,10 +182,10 @@ pub struct PortForwardEntry {
     pub pod_name: String,
     pub namespace: String,
     pub context: String,
-    pub resource: PfResource,
+    pub identity: PfIdentity,
     pub status: PortForwardStatus,
     pub connections: usize,
-    pub target: Option<PfTarget>,
+    pub target: PfTarget,
     cancel_tx: watch::Sender<bool>,
     pause_tx: watch::Sender<bool>,
 }
@@ -130,47 +227,13 @@ impl PortForwardManager {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    pub fn create(
-        &mut self,
-        client: Client,
-        namespace: String,
-        pod_name: String,
-        context: String,
-        resource_type: String,
-        resource_label: String,
-        local_port: u16,
-        remote_port: u16,
-        target: PfTarget,
-    ) -> usize {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (pause_tx, pause_rx) = watch::channel(false);
-
-        let entry = PortForwardEntry {
-            id,
-            port: PfPorts {
-                local: local_port,
-                remote: remote_port,
-            },
-            pod_name: pod_name.clone(),
-            namespace: namespace.clone(),
-            context,
-            resource: PfResource {
-                r#type: resource_type,
-                label: resource_label,
-            },
-            status: PortForwardStatus::Starting,
-            connections: 0,
-            target: Some(target.clone()),
-            cancel_tx,
-            pause_tx,
-        };
-        self.entries.push(entry);
-
+    pub fn create(&mut self, client: Client, req: PortForwardRequest) -> usize {
+        let namespace = req.namespace.clone();
+        let target = req.target.clone();
+        let local_port = req.local_port;
+        let remote_port = req.remote_port;
+        let (id, cancel_rx, pause_rx) = self.insert(req, PortForwardStatus::Starting, false);
         let update_tx = self.update_tx.clone();
-
         tokio::spawn(port_forward_task(
             id,
             client,
@@ -182,65 +245,64 @@ impl PortForwardManager {
             pause_rx,
             update_tx,
         ));
-
         id
     }
 
     /// Create a port forward entry in Paused state without spawning a
     /// background task. Used when restoring saved port forwards that were
     /// paused.
-    pub fn create_paused(
+    pub fn create_paused(&mut self, req: PortForwardRequest) -> usize {
+        self.insert(req, PortForwardStatus::Paused, true).0
+    }
+
+    fn insert(
         &mut self,
-        namespace: String,
-        pod_name: String,
-        context: String,
-        resource_type: String,
-        resource_label: String,
-        local_port: u16,
-        remote_port: u16,
-        target: PfTarget,
-    ) -> usize {
+        req: PortForwardRequest,
+        status: PortForwardStatus,
+        paused: bool,
+    ) -> (usize, watch::Receiver<bool>, watch::Receiver<bool>) {
         let id = self.next_id;
         self.next_id += 1;
-
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
-        let (pause_tx, _pause_rx) = watch::channel(true);
-
-        let entry = PortForwardEntry {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(paused);
+        self.entries.push(PortForwardEntry {
             id,
             port: PfPorts {
-                local: local_port,
-                remote: remote_port,
+                local: req.local_port,
+                remote: req.remote_port,
             },
-            pod_name,
-            namespace,
-            context,
-            resource: PfResource {
-                r#type: resource_type,
-                label: resource_label,
+            pod_name: req.target.display_pod().to_string(),
+            namespace: req.namespace,
+            context: req.context,
+            identity: PfIdentity {
+                type_key: req.type_key,
+                name: req.resource_name,
             },
-            status: PortForwardStatus::Paused,
+            status,
             connections: 0,
-            target: Some(target),
+            target: req.target,
             cancel_tx,
             pause_tx,
-        };
-        self.entries.push(entry);
-        id
+        });
+        (id, cancel_rx, pause_rx)
     }
 
     /// Spawn a new background task for a paused or errored entry.
     /// Returns true if a task was spawned.
     pub fn resume_spawn(&mut self, id: usize, client: Client) -> bool {
         let entry = match self.entries.iter_mut().find(|e| e.id == id) {
-            | Some(e) if matches!(e.status, PortForwardStatus::Paused | PortForwardStatus::Error(_)) => e,
+            | Some(e)
+                if matches!(
+                    e.status,
+                    PortForwardStatus::Paused | PortForwardStatus::Error(_) | PortForwardStatus::AuthExpired
+                ) =>
+            {
+                e
+            },
             | _ => return false,
         };
 
-        let target = match entry.target.clone() {
-            | Some(t) => t,
-            | None => return false,
-        };
+        let target = entry.target.clone();
 
         let local_port = entry.port.local;
         let remote_port = entry.port.remote;
@@ -275,6 +337,21 @@ impl PortForwardManager {
             let _ = entry.cancel_tx.send(true);
             entry.status = PortForwardStatus::Cancelled;
         }
+    }
+
+    /// Pause every running forward. Returns the ids so a later retry can resume
+    /// them.
+    pub fn pause_running(&mut self) -> Vec<usize> {
+        let ids: Vec<usize> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_running())
+            .map(|entry| entry.id)
+            .collect();
+        for id in &ids {
+            self.pause(*id);
+        }
+        ids
     }
 
     pub fn pause(&mut self, id: usize) {
@@ -377,6 +454,7 @@ async fn resolve_pod(client: &Client, namespace: &str, target: &PfTarget) -> Opt
 // Background task
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn port_forward_task(
     id: usize,
     client: Client,
@@ -445,7 +523,14 @@ async fn port_forward_task(
             }
         }
 
-        let l = listener.as_ref().unwrap();
+        // Bound on start, and rebound before leaving the pause branch.
+        let Some(l) = listener.as_ref() else {
+            let _ = update_tx.send(PfUpdate::Status {
+                id,
+                status: PortForwardStatus::Error(format!("Port :{local_port} is not bound")),
+            });
+            return;
+        };
 
         tokio::select! {
             biased;
@@ -514,6 +599,7 @@ async fn port_forward_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_pf_connection(
     id: usize,
     client: Client,
@@ -559,11 +645,19 @@ async fn handle_pf_connection(
                 }
             },
             | Err(e) => {
+                let failure = crate::k8s::ClusterFailure::from_kube(&e);
+                if failure.is_auth() {
+                    let _ = update_tx.send(PfUpdate::Status {
+                        id,
+                        status: PortForwardStatus::AuthExpired,
+                    });
+                    return;
+                }
                 attempt += 1;
                 if attempt > 10 {
                     let _ = update_tx.send(PfUpdate::Status {
                         id,
-                        status: PortForwardStatus::Error(format!("Portforward: {}", e)),
+                        status: PortForwardStatus::Error(format!("Portforward: {}", failure.detail())),
                     });
                     return;
                 }

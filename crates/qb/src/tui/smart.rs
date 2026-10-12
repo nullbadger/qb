@@ -1589,13 +1589,8 @@ fn conditions_section(l: &mut Vec<Line<'static>>, v: &Value) {
         let is_positive = POSITIVE_CONDITIONS.contains(&ctype);
         let is_negative = NEGATIVE_CONDITIONS.contains(&ctype);
 
-        let status_style = if status == "True" && is_positive {
-            Style::default().fg(Color::Green)
-        } else if status == "True" && is_negative {
-            Style::default().fg(Color::Red)
-        } else if status == "False" && is_positive {
-            Style::default().fg(Color::Red)
-        } else if status == "True" {
+        // Positive conditions win if a type is listed in both sets.
+        let status_style = if status == "True" && (is_positive || !is_negative) {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::Red)

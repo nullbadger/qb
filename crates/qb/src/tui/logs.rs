@@ -91,6 +91,14 @@ impl LogLine {
 // Pod color palette
 // ---------------------------------------------------------------------------
 
+/// Newest lines kept in the view. Older lines are dropped.
+/// ponytail: fixed cap, raise it if a session needs a longer tail.
+pub const MAX_LOG_LINES: usize = 2_000;
+
+/// Bound per follow stream. A full channel drops the line instead of
+/// growing without limit while the UI is busy or the machine is asleep.
+const LOG_CHANNEL_BOUND: usize = 256;
+
 const POD_COLORS: &[Color] = &[
     Color::Cyan,
     Color::Green,
@@ -144,12 +152,15 @@ pub struct LogViewState {
     /// Set of (pod, container) pairs that have active stream tasks.
     pub streaming_pairs: std::collections::HashSet<(String, String)>,
 
-    // Scroll & selection
+    // Scroll & selection. `selected_line` and `scroll` are indexes into the
+    // filtered view. The viewport always contains the cursor.
     pub scroll: usize,
     pub auto_scroll: bool,
     pub selected_line: Option<usize>,
     pub selection_anchor: Option<usize>,
     pub wrap: bool,
+    pub viewport_rows: usize,
+    pub viewport_cols: usize,
 
     // Pod / container
     pub pods: Vec<PodInfo>,
@@ -187,6 +198,8 @@ impl LogViewState {
             selected_line: None,
             selection_anchor: None,
             wrap: false,
+            viewport_rows: 20,
+            viewport_cols: 80,
             pods,
             selection: LogSelection {
                 pod: None,
@@ -204,7 +217,57 @@ impl LogViewState {
             state.ensure_pod_color(&line.pod);
         }
         state.lines = initial_lines;
+        state.trim();
         state
+    }
+
+    /// Drop oldest lines past [`MAX_LOG_LINES`] and shift the cursor by the
+    /// same number of visible lines, so a follow trim does not select a
+    /// different row.
+    pub fn trim(&mut self) {
+        if self.lines.len() <= MAX_LOG_LINES {
+            return;
+        }
+        let drop_n = self.lines.len() - MAX_LOG_LINES;
+        let visible_dropped = self.lines[..drop_n]
+            .iter()
+            .filter(|line| self.line_matches(line))
+            .count();
+        trim_log_lines(&mut self.lines, MAX_LOG_LINES);
+        self.note_dropped_visible(visible_dropped);
+    }
+
+    fn note_dropped_visible(&mut self, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        self.scroll = self.scroll.saturating_sub(dropped);
+        if let Some(sel) = self.selected_line {
+            self.selected_line = Some(sel.saturating_sub(dropped));
+        }
+        if let Some(anchor) = self.selection_anchor {
+            self.selection_anchor = Some(anchor.saturating_sub(dropped));
+        }
+    }
+
+    pub fn display_rows(&self, line: &LogLine) -> usize {
+        row_height(
+            self.wrap,
+            line.display_text().chars().count(),
+            self.viewport_cols.max(1),
+        )
+    }
+
+    fn line_matches(&self, line: &LogLine) -> bool {
+        if self.filter.text.is_empty() {
+            return true;
+        }
+        let text = line.display_text();
+        if let Some(re) = &self.filter.regex {
+            re.is_match(&text)
+        } else {
+            text.contains(&self.filter.text)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -327,7 +390,7 @@ impl LogViewState {
         self.streaming_pairs.insert(key);
         self.ensure_pod_color(&pod);
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_BOUND);
         let ns = ns.to_string();
         let pod_tag = pod.clone();
         let container_tag = container.clone();
@@ -421,6 +484,7 @@ impl LogViewState {
             result.extend(tail_iter);
             self.lines.extend(result);
         }
+        self.trim();
     }
 
     // -----------------------------------------------------------------------
@@ -493,7 +557,7 @@ impl LogViewState {
             Regex::new(&self.filter.text).ok()
         };
         self.filter.editing = false;
-        self.scroll = 0;
+        self.reset_navigation();
     }
 
     pub fn cancel_filter_edit(&mut self) {
@@ -505,20 +569,149 @@ impl LogViewState {
         self.filter.text.clear();
         self.filter.regex = None;
         self.filter.buf.clear();
-        self.scroll = 0;
+        self.reset_navigation();
     }
 
     // -----------------------------------------------------------------------
     // Navigation
     // -----------------------------------------------------------------------
 
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
+    fn reset_navigation(&mut self) {
+        self.scroll = 0;
+        self.selected_line = None;
+        self.selection_anchor = None;
         self.auto_scroll = false;
     }
 
-    pub fn scroll_down(&mut self, n: usize, visible_count: usize) {
-        self.scroll = (self.scroll + n).min(visible_count.saturating_sub(1));
+    pub fn visible_len(&self) -> usize {
+        self.visible_lines().len()
+    }
+
+    /// Move the cursor by `delta` visible lines. The viewport follows.
+    /// Moving down while already on the tail does not unpin follow.
+    pub fn move_cursor(&mut self, delta: isize, extend: bool) {
+        let n = self.visible_len();
+        if n == 0 {
+            self.reset_navigation();
+            return;
+        }
+        let current = self.selected_line.unwrap_or_else(|| self.scroll.min(n - 1));
+        if extend {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(current);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current + delta as usize).min(n - 1)
+        };
+        if next != current {
+            self.auto_scroll = false;
+        }
+        self.selected_line = Some(next);
+        if !self.auto_scroll {
+            self.scroll = self.reveal_scroll(next);
+        }
+    }
+
+    pub fn page(&mut self, direction: isize) {
+        let step = self.viewport_rows.max(1) as isize;
+        self.move_cursor(direction * step, false);
+    }
+
+    pub fn jump(&mut self, to_end: bool) {
+        let n = self.visible_len();
+        if n == 0 {
+            self.reset_navigation();
+            return;
+        }
+        self.selection_anchor = None;
+        if to_end {
+            self.selected_line = Some(n - 1);
+            self.auto_scroll = self.following;
+            self.scroll = self.reveal_scroll(n - 1);
+        } else {
+            self.auto_scroll = false;
+            self.selected_line = Some(0);
+            self.scroll = 0;
+        }
+    }
+
+    /// Pin the cursor to the last visible line and scroll so that line is in
+    /// view.
+    pub fn stick_to_tail(&mut self) {
+        let n = self.visible_len();
+        if n == 0 {
+            self.scroll = 0;
+            self.selected_line = None;
+            return;
+        }
+        self.selection_anchor = None;
+        self.selected_line = Some(n - 1);
+        self.scroll = self.reveal_scroll(n - 1);
+    }
+
+    pub fn clamp_navigation(&mut self) {
+        let n = self.visible_len();
+        if n == 0 {
+            self.reset_navigation();
+            return;
+        }
+        if let Some(sel) = self.selected_line {
+            self.selected_line = Some(sel.min(n - 1));
+        }
+        if let Some(anchor) = self.selection_anchor {
+            self.selection_anchor = Some(anchor.min(n - 1));
+        }
+        self.scroll = self.scroll.min(n - 1);
+        if let Some(sel) = self.selected_line {
+            self.scroll = self.reveal_scroll(sel);
+        }
+    }
+
+    fn reveal_scroll(&self, cursor: usize) -> usize {
+        let lines = self.visible_lines();
+        let n = lines.len();
+        if n == 0 || cursor >= n {
+            return 0;
+        }
+        let height = self.viewport_rows.max(1);
+        if !self.wrap {
+            if cursor < self.scroll {
+                return cursor;
+            }
+            if cursor >= self.scroll.saturating_add(height) {
+                return cursor + 1 - height;
+            }
+            return self.scroll.min(n - 1);
+        }
+        if cursor < self.scroll {
+            return cursor;
+        }
+        let cursor_h = self.display_rows(lines[cursor]);
+        if cursor_h >= height {
+            return cursor;
+        }
+        let mut used = cursor_h;
+        let mut scroll = cursor;
+        while scroll > 0 {
+            let h = self.display_rows(lines[scroll - 1]);
+            if used + h > height {
+                break;
+            }
+            used += h;
+            scroll -= 1;
+        }
+        if self.scroll <= cursor && self.scroll >= scroll {
+            let span: usize = (self.scroll..=cursor).map(|i| self.display_rows(lines[i])).sum();
+            if span <= height {
+                return self.scroll;
+            }
+        }
+        scroll
     }
 
     /// Returns (start, end) inclusive range if a multi-line selection exists.
@@ -541,6 +734,21 @@ impl Drop for LogViewState {
 // Async log streaming task — one per pod/container pair
 // ---------------------------------------------------------------------------
 
+fn row_height(wrap: bool, text_len: usize, width: usize) -> usize {
+    if !wrap || width == 0 || text_len == 0 {
+        1
+    } else {
+        text_len.div_ceil(width).max(1)
+    }
+}
+
+fn trim_log_lines(lines: &mut Vec<LogLine>, max: usize) {
+    if lines.len() > max {
+        let drop_n = lines.len() - max;
+        lines.drain(0..drop_n);
+    }
+}
+
 async fn log_stream_task(
     client: Client,
     ns: String,
@@ -548,7 +756,7 @@ async fn log_stream_task(
     container: String,
     pod_tag: String,
     container_tag: String,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
 ) {
     use futures::{
         AsyncBufReadExt,
@@ -574,11 +782,105 @@ async fn log_stream_task(
     while let Some(result) = lines.next().await {
         match result {
             | Ok(line) => {
-                if tx.send(format!("{}{}", prefix, line)).is_err() {
-                    return;
+                // ponytail: drop when the UI is behind. A blocking send would
+                // pin a runtime worker and grow memory across sleep.
+                match tx.try_send(format!("{}{}", prefix, line)) {
+                    | Ok(()) => {},
+                    | Err(mpsc::TrySendError::Disconnected(_)) => return,
+                    | Err(mpsc::TrySendError::Full(_)) => {},
                 }
             },
             | Err(_) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        trim_log_lines,
+        LogLine,
+        LogViewState,
+    };
+
+    fn view_with(n: usize) -> LogViewState {
+        let lines = (0..n)
+            .map(|i| {
+                LogLine {
+                    pod: String::new(),
+                    container: String::new(),
+                    timestamp: String::new(),
+                    message: i.to_string(),
+                }
+            })
+            .collect();
+        let mut state = LogViewState::new(Vec::new(), "ns".into(), lines);
+        state.viewport_rows = 4;
+        state.viewport_cols = 80;
+        state.auto_scroll = false;
+        state
+    }
+
+    #[test]
+    fn moving_up_from_the_tail_stays_on_that_line() {
+        let mut state = view_with(10);
+        state.auto_scroll = true;
+        state.stick_to_tail();
+        assert_eq!(state.selected_line, Some(9));
+        state.move_cursor(-1, false);
+        assert_eq!(state.selected_line, Some(8));
+        assert!(!state.auto_scroll);
+        assert!(state.scroll <= 8);
+        assert!(state.scroll + state.viewport_rows > 8);
+    }
+
+    #[test]
+    fn page_moves_the_cursor_with_the_viewport() {
+        let mut state = view_with(20);
+        state.viewport_rows = 5;
+        state.selected_line = Some(0);
+        state.scroll = 0;
+        state.page(1);
+        assert_eq!(state.selected_line, Some(5));
+        assert!(state.scroll <= 5);
+        assert!(state.scroll + state.viewport_rows > 5);
+    }
+
+    #[test]
+    fn trim_keeps_the_same_logical_line_selected() {
+        let mut state = view_with(6);
+        state.selected_line = Some(4);
+        state.scroll = 2;
+        state.note_dropped_visible(2);
+        assert_eq!(state.selected_line, Some(2));
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn filter_does_not_keep_a_stale_cursor() {
+        let mut state = view_with(5);
+        state.selected_line = Some(3);
+        state.filter.buf = "1".into();
+        state.apply_filter();
+        assert_eq!(state.selected_line, None);
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn log_buffer_keeps_the_newest_lines() {
+        let mut lines: Vec<LogLine> = (0..5)
+            .map(|i| {
+                LogLine {
+                    pod: String::new(),
+                    container: String::new(),
+                    timestamp: String::new(),
+                    message: i.to_string(),
+                }
+            })
+            .collect();
+        trim_log_lines(&mut lines, 2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].message, "3");
+        assert_eq!(lines[1].message, "4");
     }
 }

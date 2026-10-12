@@ -44,8 +44,15 @@ crates/qb/src/
    appears automatically. Switching clusters resets to all-namespaces.
 3. **All-pods/all-containers by default** — Log views aggregate all pods and containers for a
    workload. Users narrow down with popup selectors (`p`/`c`).
-4. **Non-blocking UI** — API calls are deferred via `PendingLoad` and executed between frames.
-   Log streaming uses async tasks with `mpsc` channels polled each tick. The UI never blocks on I/O.
+4. **Non-blocking UI** — The event loop never awaits the API. Reads and writes are
+   `Jobs` slots (`tui/jobs.rs`): the UI spawns them and applies results with
+   `try_recv`. A new navigation read aborts the previous one. A write is not
+   aborted by a refresh. Log follow uses a bounded channel and a 2_000-line cap.
+   A wall-clock jump (sleep/wake) drops in-flight reads and follow streams and
+   pauses refresh so a backlog cannot fill memory.
+   Exec credential plugins are forced non-interactive with stderr discarded so
+   `gcloud` cannot paint over the alternate screen. An expired login opens a
+   prompt, pauses cluster calls, and waits for `r` (retry) or `q` (quit).
 5. **Auto-refresh** — Resource list and cluster stats refresh every 2 seconds. Scroll position and
    selection are always preserved across refreshes — never reset viewport on auto-refresh.
    Breadcrumb shows refresh timestamp right-aligned. `p` pauses/resumes globally.
@@ -82,7 +89,7 @@ Keyboard-driven. All navigation uses vim-style bindings.
 | `Ctrl+p` | Command palette |
 | `Ctrl+s` | Save current profile |
 | `P` | Load/switch profile |
-| `p` | Pause/resume auto-refresh (except log view, port forwards view) |
+| `p` | Pause is in the command palette (log view: pod, port forwards: pause forward) |
 
 ### Main View
 
@@ -385,14 +392,19 @@ structs. Discovered CRs appear in the sidebar grouped by API group domain as sub
 Architecture:
 - **`CrdInfo`** (`k8s/mod.rs`) — holds group, version, kind, plural, scope, display name,
   and `additionalPrinterColumns` for dynamic API operations and table rendering.
-- **`Panel::CustomResourceList(CrdInfo)`** — panel variant for browsing CR instances.
-- **`NavItemKind::CustomResource(CrdInfo)`** — sidebar nav item for each discovered CRD.
+- **`ResourceKind`** — `Builtin(ResourceType)` or `Custom(CrdInfo)`. One value, so edit/delete/list
+  paths cannot pair a dummy `ResourceType` with a CRD.
+- **`Panel::Resources(ResourceKind)`** — panel variant for browsing builtin or CR instances.
+- **`NavItemKind::Resource(ResourceKind)`** — sidebar nav item for a builtin type or discovered CRD.
 - **`NavItemKind::SubCategory`** — non-selectable dimmer header for API group domains.
 - **`PendingLoad::DiscoverCrds`** — async CRD discovery, chained on startup before ClusterStats.
   Also triggered on context switch, profile switch, and kubeconfig load.
-- **`PendingLoad::CustomResources`** / **`CustomResourceDetail`** — deferred loading for CRs.
-- Dynamic API methods: `list_custom_resources()`, `get_custom_resource()`,
-  `replace_custom_resource()`, `delete_custom_resource()`, `patch_custom_resource_metadata()`.
+- **`PendingLoad::Resources`** / **`ResourceDetail`** — deferred loading. The current
+  `Panel::Resources` kind selects the builtin or dynamic API.
+- Dynamic API methods: `KubeClient::list_kind()`, `get_kind()`, `replace_kind_yaml()`,
+  `delete_kind()`, `patch_kind_metadata()`. Create resolves plural and scope from
+  `ResourceType::from_gvk`, discovered CRDs, then `kube::discovery::pinned_kind` — never a
+  `kind + "s"` guess.
 - Generic smart renderer: `smart::render_custom_resource()` renders metadata, spec, status
   as a key-value tree. CRD definitions use `smart::render_crd()`.
 - Table columns come from CRD `additionalPrinterColumns` via `CrdInfo::column_headers()`.
@@ -401,9 +413,10 @@ Architecture:
 Supported operations on CRs: Browse, Detail (Smart + YAML), Edit, Delete, Diff, Favorites.
 Not supported (correctly gated): Logs, Scale, Restart, Exec, Port Forward.
 
-Edit/delete flows carry `Option<CrdInfo>` alongside `ResourceType` in `PendingEdit`,
-`EditContext`, and `Popup::ConfirmDelete`. When `crd_info` is `Some`, dynamic API methods
-are used; otherwise, the standard `ResourceType`-based methods run.
+Edit/delete flows carry `ResourceKind` in `PendingEdit`, `EditContext`, `PendingMetadataEdit`,
+and `Popup::ConfirmDelete`. `FavoriteType` is the config key: a singular name for builtins,
+`cr:{group}/{plural}` for custom resources. Port-forward identity stores the resource name
+separately from the display label.
 
 ## Coding Standards
 
@@ -455,10 +468,9 @@ Resource types are a `ResourceType` enum. Adding a new type means:
 7. Add to `api_resource()` and `is_cluster_scoped()` match arms
 8. Add `sort_key: None` (or `Some(...)` for sortable types) to the `ResourceEntry` constructor
 
-Custom Resources bypass the `ResourceType` enum entirely — they use `CrdInfo` + `DynamicObject`
-for all API operations. `Panel::CustomResourceList(CrdInfo)` and `NavItemKind::CustomResource(CrdInfo)`
-are separate enum variants, not `ResourceType` variants. Edit/delete flows carry `Option<CrdInfo>`
-to select between static and dynamic API paths.
+Custom Resources are not `ResourceType` variants. `ResourceKind::Custom(CrdInfo)` is the other
+arm of the same sum type used by `Panel::Resources` and `NavItemKind::Resource`. Operations that
+apply to both builtins and CRs take `&ResourceKind` and dispatch once.
 
 Views (`View::Main | Detail | Logs | EditDiff`), detail modes (`DetailMode::Smart | Yaml`),
 diff modes (`DiffMode::Inline | SideBySide`), and pending loads (`PendingLoad`) all use enums
@@ -478,8 +490,8 @@ for exhaustive matching. No `unreachable!()` in dispatch.
   only commands available in the current context. `help_entries_for_context()` filters by
   context + Global. Users press `Tab` to toggle to the full list. If a command's context is
   wrong, it will be invisible in the help screen when the user needs it most.
-- **Deferred loading**: Queue a `PendingLoad` variant → `process_pending_load()` runs it after
-  the next render. Never call `block_on` inside a key handler directly.
+- **Deferred loading**: Queue a `PendingLoad`. `kick_pending()` spawns it; `poll_jobs()`
+  applies the result. Never `.await` a cluster call on the UI task.
 - **Selection preservation**: When refreshing a list, save the selected item's `(name, namespace)`
   pair, reload, then find the same pair in the new list. Never reset `TableState` to `default()`
   on refresh — only update the selected index to preserve viewport offset.
@@ -525,6 +537,8 @@ for exhaustive matching. No `unreachable!()` in dispatch.
 - **rustls** with `ring` feature — TLS crypto provider (must be explicit since rustls 0.23+).
 - **jiff** — Time arithmetic (duration formatting, age display). Replaced chrono.
 - **arboard** — System clipboard access for secret copying.
+- **dirs** — Home and config path resolution. Config stays at `~/.config/qb/config.yaml`
+  (not the platform config dir) so existing files keep loading.
 - **similar** — Text diff computation (unified diff for edit preview).
 - **tempfile** — Temp file creation for editor invocation.
 - **semver** — Semantic version parsing and comparison for config compatibility checking.

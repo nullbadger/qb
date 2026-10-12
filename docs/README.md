@@ -96,9 +96,9 @@ qb gives you a single binary that connects directly to the K8s API server throug
 
 ### Command Palette
 
-- `Ctrl+p` to open
-- Type to fuzzy-search resources across all types in the cluster
-- Prefix with `>` to search available commands
+- `Ctrl+p` opens actions for the current view. Type to filter, Enter runs the action.
+- Not every action has a hotkey. Mutations (delete, restart, scale, cordon, drain, create, cancel forward) ask for confirmation before they run.
+- A non-empty query also matches resources in the current list.
 - Context-aware help with `?` (press `Tab` to see all keybindings)
 
 ### Exec (Experimental)
@@ -144,7 +144,7 @@ At runtime, press `c` to switch cluster context, `n` to switch namespace, or `O`
 | `Ctrl+p` | Command palette |
 | `Ctrl+s` | Save profile |
 | `P` | Load/switch profile |
-| `p` | Pause/resume auto-refresh |
+| `p` | Pause refresh is in the command palette |
 
 ### Main View
 
@@ -220,7 +220,7 @@ At runtime, press `c` to switch cluster context, `n` to switch namespace, or `O`
 
 qb uses the [kube](https://github.com/kube-rs/kube) crate with [rustls](https://github.com/rustls/rustls) for direct communication with the Kubernetes API server. Authentication and cluster details come from your kubeconfig (`~/.kube/config` or `$KUBECONFIG`). There is no dependency on `kubectl` for any operation except exec (which spawns `kubectl exec` in a new terminal window).
 
-The TUI is built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm). All API calls are deferred and executed between render frames so the UI never blocks. Log streaming and port forwarding run as background async tasks with channel-based updates polled each tick.
+The TUI is built on [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm). Cluster calls run on background tasks; the event loop only draws, polls, and handles keys, so a slow or dead API cannot freeze the UI. Log follow is capped (bounded channel, 2,000 lines). After a sleep/wake the app drops follow streams and pauses refresh instead of replaying a backlog.
 
 Custom Resource support works by discovering all CRDs at startup and using the kube dynamic API (`DynamicObject` + `ApiResource`) to list, inspect, edit, and delete CR instances without compile-time type information. CRD `additionalPrinterColumns` are used to render table columns.
 

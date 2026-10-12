@@ -13,7 +13,11 @@ use {
         smart,
     },
     crate::{
-        k8s::ResourceType,
+        k8s::{
+            Category,
+            FavoriteType,
+            ResourceType,
+        },
         portforward::PortForwardStatus,
     },
     ratatui::{
@@ -132,11 +136,8 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 
     if let Some(err) = &app.error {
         spans.push(Span::styled("  ", dim));
-        let truncated = if err.len() > 60 {
-            format!("{}…", &err[..60])
-        } else {
-            err.clone()
-        };
+        let clean = crate::k8s::KubeClient::display_error(err);
+        let truncated: String = clean.chars().take(60).collect();
         spans.push(Span::styled(
             format!(" {} ", truncated),
             Style::default().fg(Color::White).bg(Color::Red),
@@ -147,6 +148,8 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     let elapsed = app.last_refresh.elapsed().as_secs();
     let right_text = if app.paused {
         " ⏸ paused ".to_string()
+    } else if app.is_busy() {
+        " ⟳ loading ".to_string()
     } else if elapsed < 2 {
         " ⟳ just now ".to_string()
     } else if elapsed < 60 {
@@ -224,8 +227,7 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
                 | (NavItemKind::Favorites, Panel::Favorites) => true,
                 | (NavItemKind::PortForwards, Panel::PortForwards) => true,
                 | (NavItemKind::Profiles, Panel::Profiles) => true,
-                | (NavItemKind::Resource(rt), Panel::ResourceList(prt)) => rt == prt,
-                | (NavItemKind::CustomResource(crd), Panel::CustomResourceList(pcrd)) => crd == pcrd,
+                | (NavItemKind::Resource(kind), Panel::Resources(panel_kind)) => kind == panel_kind,
                 | _ => false,
             };
             let style = match &item.kind {
@@ -236,8 +238,8 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
                 | _ => Style::default().fg(Color::White),
             };
             // Append resource count badge if available
-            let label = if let NavItemKind::Resource(rt) = &item.kind {
-                if let Some(&count) = app.resources.counts.get(rt) {
+            let label = if let NavItemKind::Resource(kind) = &item.kind {
+                if let Some(&count) = app.resources.counts.get(kind) {
                     format!("{} ({})", item.label, count)
                 } else {
                     item.label.clone()
@@ -313,18 +315,10 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
             render_resource_map(f, app, area);
             return;
         },
-        | Panel::ResourceList(_) | Panel::CustomResourceList(_) => {},
+        | Panel::Resources(_) => {},
     }
 
-    // Determine column headers: either from a built-in ResourceType or a CrdInfo
-    let (base_headers_owned, is_event) = if let Some(rt) = app.selected_resource_type() {
-        (
-            rt.column_headers().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            rt == ResourceType::Event,
-        )
-    } else if let Some(crd) = app.selected_crd_info() {
-        (crd.column_headers(), false)
-    } else {
+    let Some(kind) = app.selected_kind() else {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -332,6 +326,8 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(block, area);
         return;
     };
+    let is_event = kind.is_event();
+    let base_headers_owned = kind.column_headers();
 
     if is_event {
         render_events_log(f, app, area);
@@ -359,14 +355,14 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     .height(1);
 
     // Pre-compute favorite set for this resource type to avoid borrow conflicts
-    let fav_set: std::collections::HashSet<(String, String)> = if let Some(rt) = app.selected_resource_type() {
+    let fav_key = app.selected_kind().map(|kind| kind.favorite_key());
+    let fav_set: std::collections::HashSet<(String, String)> = if let Some(key) = fav_key {
         let context = app.kube.context.name.as_str();
-        let rt_name = rt.singular_name();
         app.config
             .active_profile()
             .favorites
             .iter()
-            .filter(|f| f.resource_type == rt_name && f.context == context)
+            .filter(|f| f.resource_type == key && f.context == context)
             .map(|f| (f.name.clone(), f.namespace.clone()))
             .collect()
     } else {
@@ -381,8 +377,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
             let is_diff_marked = app
                 .diff_mark
                 .as_ref()
-                .map(|(n, ns, _)| n == &entry.name && ns == &entry.namespace)
-                .unwrap_or(false);
+                .is_some_and(|mark| mark.name == entry.name && mark.namespace == entry.namespace);
 
             let is_favorited = fav_set.contains(&(entry.name.clone(), entry.namespace.clone()));
 
@@ -475,9 +470,8 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Resources;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let title = app
-        .selected_resource_type()
-        .map(|rt| format!(" {} ", rt.display_name()))
-        .or_else(|| app.selected_crd_info().map(|c| format!(" {} ", c.display_name)))
+        .selected_kind()
+        .map(|kind| format!(" {} ", kind.display_name()))
         .unwrap_or_else(|| " Resources ".to_string());
 
     // Map real selection index to filtered row position for highlight.
@@ -1415,7 +1409,7 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
     let total_mem_req: f64 = filtered_pods.iter().map(|p| p.spec.mem_request).sum();
     let total_mem_lim: f64 = filtered_pods.iter().map(|p| p.spec.mem_limit).sum();
     let inner_w = area.width.saturating_sub(4) as usize;
-    let bar_w = inner_w.saturating_sub(32).min(50).max(15);
+    let bar_w = inner_w.saturating_sub(32).clamp(15, 50);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1552,10 +1546,7 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
                     .iter()
                     .map(|w| w.cpu_usage.max(w.cpu_request).max(w.cpu_limit))
                     .fold(0.0f64, f64::max);
-                (
-                    m,
-                    Box::new(|v| crate::k8s::format_cpu_cores(v)) as Box<dyn Fn(f64) -> String>,
-                )
+                (m, Box::new(crate::k8s::format_cpu_cores) as Box<dyn Fn(f64) -> String>)
             },
             | ResourceMapSort::Memory => {
                 let m = wls
@@ -1564,7 +1555,7 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
                     .fold(0.0f64, f64::max);
                 (
                     m,
-                    Box::new(|v| crate::k8s::format_memory_gb_from_bytes(v)) as Box<dyn Fn(f64) -> String>,
+                    Box::new(crate::k8s::format_memory_gb_from_bytes) as Box<dyn Fn(f64) -> String>,
                 )
             },
         };
@@ -1705,7 +1696,7 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled("    ", detail_dim),
                     Span::styled(format!("{} ", wl.kind), detail_dim),
-                    Span::styled(format!("{}", wl.name), detail_val),
+                    Span::styled(wl.name.clone(), detail_val),
                     Span::styled(format!("  ns:{}", wl.namespace), detail_dim),
                     Span::styled(format!("  pods:{}", wl.pod_count), detail_dim),
                 ]));
@@ -2764,13 +2755,10 @@ fn render_yaml_lines(yaml: &str) -> Vec<Line<'_>> {
 // ---------------------------------------------------------------------------
 
 fn render_logs(f: &mut Frame, app: &mut App) {
-    let state = match &app.log {
-        | Some(s) => s,
-        | None => return,
-    };
-
-    // Layout: breadcrumb + log status + log content + filter bar + hotkey bar
-    let has_filter_bar = state.filter.editing || !state.filter.text.is_empty();
+    let has_filter_bar = app
+        .log
+        .as_ref()
+        .is_some_and(|state| state.filter.editing || !state.filter.text.is_empty());
     let filter_height = if has_filter_bar { 1 } else { 0 };
 
     let outer = Layout::default()
@@ -2786,6 +2774,20 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     render_breadcrumb(f, app, outer[0]);
 
+    if let Some(state) = &mut app.log {
+        state.viewport_rows = outer[2].height as usize;
+        state.viewport_cols = outer[2].width as usize;
+        if state.auto_scroll {
+            state.stick_to_tail();
+        } else {
+            state.clamp_navigation();
+        }
+    }
+    let state = match &app.log {
+        | Some(s) => s,
+        | None => return,
+    };
+
     // Status line: mode badges + line count
     {
         let dim = Style::default().fg(Color::DarkGray);
@@ -2797,15 +2799,17 @@ fn render_logs(f: &mut Frame, app: &mut App) {
         if state.wrap {
             spans.push(Span::styled("[Wrap] ", badge));
         }
-        let visible = state.visible_lines();
-        let vis_count = visible.len();
-        let scroll_pos = state.scroll.min(vis_count.saturating_sub(1));
+        let vis_count = state.visible_len();
+        let cursor = state
+            .selected_line
+            .unwrap_or(state.scroll)
+            .min(vis_count.saturating_sub(1));
         let line_info = if let Some((start, end)) = state.selection_range() {
-            format!("{} selected  {}/{}", end - start + 1, scroll_pos + 1, vis_count)
+            format!("{} selected  {}/{}", end - start + 1, cursor + 1, vis_count)
         } else if vis_count == 0 {
             "0/0".to_string()
         } else {
-            format!("{}/{}", scroll_pos + 1, vis_count)
+            format!("{}/{}", cursor + 1, vis_count)
         };
         let left_len: usize = spans.iter().map(|s| s.width()).sum();
         let pad = (outer[1].width as usize).saturating_sub(left_len + line_info.len());
@@ -2816,45 +2820,13 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     // Log lines (filtered) — no borders for clean text selection
     let visible = state.visible_lines();
-    let area_width = outer[2].width as usize;
     let area_height = outer[2].height as usize;
     let sel_range = state.selection_range();
 
     // When wrapping, compute how many terminal rows each logical line takes
-    let wrapped_heights: Vec<usize> = if state.wrap && area_width > 0 {
-        visible
-            .iter()
-            .map(|l| {
-                let len = l.display_text().len();
-                if len == 0 {
-                    1
-                } else {
-                    (len + area_width - 1) / area_width
-                }
-            })
-            .collect()
-    } else {
-        vec![1; visible.len()]
-    };
+    let wrapped_heights: Vec<usize> = visible.iter().map(|line| state.display_rows(line)).collect();
 
-    let total_rows: usize = wrapped_heights.iter().sum();
-
-    // Auto-scroll: find the scroll offset (in logical lines) that shows the end
-    let scroll_offset = if state.auto_scroll && total_rows > area_height {
-        // Find first logical line such that remaining rows fit in area_height
-        let mut remaining = total_rows;
-        let mut offset = 0;
-        for h in &wrapped_heights {
-            if remaining <= area_height {
-                break;
-            }
-            remaining -= h;
-            offset += 1;
-        }
-        offset
-    } else {
-        state.scroll.min(visible.len().saturating_sub(1))
-    };
+    let scroll_offset = state.scroll.min(visible.len().saturating_sub(1));
 
     // Collect logical lines that fit in the viewport (accounting for wrap)
     let mut rows_used = 0;
@@ -3064,7 +3036,10 @@ fn build_hotkey_bar(app: &App) -> Line<'static> {
         spans.push(sep.clone());
     }
 
-    // Always show help hint
+    // Actions live in the palette. Keep the entry point on every bar.
+    spans.push(Span::styled(" Ctrl+P ", key_style));
+    spans.push(Span::styled(" Actions", label_style));
+    spans.push(sep.clone());
     spans.push(Span::styled(" ? ", key_style));
     spans.push(Span::styled(" Help", label_style));
 
@@ -3160,55 +3135,42 @@ fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.profiles.table_state);
 }
 
-/// Short human-readable label for a favorite's resource type string.
-fn favorite_type_label(rt_str: &str) -> &str {
-    match rt_str {
-        | "deployment" => "Deploy",
-        | "statefulset" => "StatefulSet",
-        | "daemonset" => "DaemonSet",
-        | "replicaset" => "ReplicaSet",
-        | "pod" => "Pod",
-        | "cronjob" => "CronJob",
-        | "job" => "Job",
-        | "hpa" => "HPA",
-        | "configmap" => "ConfigMap",
-        | "secret" => "Secret",
-        | "service" => "Service",
-        | "ingress" => "Ingress",
-        | "endpoints" => "Endpoints",
-        | "networkpolicy" => "NetPolicy",
-        | "pvc" => "PVC",
-        | "pv" => "PV",
-        | "storageclass" => "StorageClass",
-        | "serviceaccount" => "SA",
-        | "role" => "Role",
-        | "rolebinding" => "RoleBinding",
-        | "clusterrole" => "ClusterRole",
-        | "clusterrolebinding" => "CRBinding",
-        | "node" => "Node",
-        | "namespace" => "Namespace",
-        | "event" => "Event",
-        | "crd" => "CRD",
-        | s if s.starts_with("cr:") => {
-            // "cr:group/plural" → show the plural part
-            s.split('/').last().unwrap_or("CR")
-        },
-        | _ => "Resource",
+fn type_color(kind: &FavoriteType) -> Color {
+    match kind.builtin_type().map(ResourceType::category) {
+        | Some(Category::Workloads) => Color::Green,
+        | Some(Category::Network) => Color::Cyan,
+        | Some(Category::Config) => Color::Yellow,
+        | Some(Category::Storage) => Color::Blue,
+        | Some(Category::Rbac) => Color::Magenta,
+        | Some(Category::Cluster) => Color::White,
+        | None if kind.custom_ref().is_some() => Color::LightCyan,
+        | None => Color::DarkGray,
     }
 }
 
-/// Color for a resource type category.
-fn type_color(rt_str: &str) -> Color {
-    match rt_str {
-        | "deployment" | "statefulset" | "daemonset" | "replicaset" | "pod" | "cronjob" | "job" | "hpa" => Color::Green,
-        | "service" | "ingress" | "endpoints" | "networkpolicy" => Color::Cyan,
-        | "configmap" | "secret" => Color::Yellow,
-        | "pvc" | "pv" | "storageclass" => Color::Blue,
-        | "serviceaccount" | "role" | "rolebinding" | "clusterrole" | "clusterrolebinding" => Color::Magenta,
-        | "node" | "namespace" | "event" | "crd" => Color::White,
-        | s if s.starts_with("cr:") => Color::LightCyan,
-        | _ => Color::DarkGray,
-    }
+fn render_choice_list(f: &mut Frame, area: Rect, title: &str, items: &[String], state: &mut ListState) {
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == 0 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(item.as_str()).style(style)
+        })
+        .collect();
+    let list = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, state);
 }
 
 fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3276,11 +3238,9 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
                     let is_diff_marked = app
                         .diff_mark
                         .as_ref()
-                        .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
-                        .unwrap_or(false);
+                        .is_some_and(|mark| mark.name == fav.name && mark.namespace == fav.namespace);
 
-                    // Type label + color
-                    let type_label = favorite_type_label(&fav.resource_type);
+                    let type_label = fav.resource_type.short_label();
                     let t_color = type_color(&fav.resource_type);
                     let type_cell = Cell::from(Span::styled(
                         type_label.to_string(),
@@ -3470,25 +3430,28 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
                         | PortForwardStatus::Active => Style::default().fg(Color::Green),
                         | PortForwardStatus::Paused => Style::default().fg(Color::Yellow),
                         | PortForwardStatus::Reconnecting { .. } => Style::default().fg(Color::Yellow),
-                        | PortForwardStatus::Error(_) => Style::default().fg(Color::Red),
+                        | PortForwardStatus::Error(_) | PortForwardStatus::AuthExpired => {
+                            Style::default().fg(Color::Red)
+                        },
                         | PortForwardStatus::Starting => Style::default().fg(Color::Cyan),
                         | PortForwardStatus::Cancelled => Style::default().fg(Color::DarkGray),
                     };
                     let status_text = match &entry.status {
                         | PortForwardStatus::Reconnecting { attempt } => format!("Retry({})", attempt),
                         | PortForwardStatus::Error(msg) => msg.clone(),
+                        | PortForwardStatus::AuthExpired => "Login expired".to_string(),
                         | other => other.display().to_string(),
                     };
                     Row::new(vec![
                         Cell::from(Span::styled(status_text, status_style)),
                         Cell::from(Span::styled(
-                            entry.resource.r#type.as_str(),
+                            entry.identity.type_label(),
                             Style::default().fg(Color::DarkGray),
                         )),
                         Cell::from(format!(":{}", entry.port.local)),
                         Cell::from(format!(":{}", entry.port.remote)),
                         Cell::from(entry.context.as_str()),
-                        Cell::from(entry.resource.label.as_str()),
+                        Cell::from(entry.identity.resource_label()),
                         Cell::from(entry.pod_name.as_str()),
                         Cell::from(entry.connections.to_string()),
                     ])
@@ -3696,13 +3659,7 @@ fn render_palette(f: &mut Frame, app: &mut App) {
         )));
     }
 
-    let hint = if p.buf.starts_with('>') {
-        " Commands (type to filter) "
-    } else if p.global {
-        " Search ALL resources  |  Tab=local  |  > commands "
-    } else {
-        " Search resources  |  Tab=all types  |  > commands "
-    };
+    let hint = " Actions  |  type to filter  |  Enter runs  |  Esc closes ";
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3745,6 +3702,8 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             | Popup::PortForwardEditPort { .. }
             | Popup::ProfileClone { .. }
             | Popup::ConfirmDeleteProfile { .. }
+            | Popup::Confirm { .. }
+            | Popup::AuthExpired { .. }
     ) {
         let a = centered_rect(45, 50, f.area());
         f.render_widget(Clear, a);
@@ -3813,36 +3772,11 @@ fn render_popup(f: &mut Frame, app: &mut App) {
 
             f.render_stateful_widget(list, area, state);
         },
-        | Popup::PodSelect { .. } | Popup::ContainerSelect { .. } => {
-            let (title, items, state) = match popup {
-                | Popup::PodSelect { items, state } => (" Select Pod ", items, state),
-                | Popup::ContainerSelect { items, state } => (" Select Container ", items, state),
-                | _ => unreachable!(),
-            };
-            let list_items: Vec<ListItem> = items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let style = if i == 0 {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(item.as_str()).style(style)
-                })
-                .collect();
-
-            let list = List::new(list_items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .title(title),
-                )
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
-                .highlight_symbol("▶ ");
-
-            f.render_stateful_widget(list, area, state);
+        | Popup::PodSelect { items, state } => {
+            render_choice_list(f, area, " Select Pod ", items, state);
+        },
+        | Popup::ContainerSelect { items, state } => {
+            render_choice_list(f, area, " Select Container ", items, state);
         },
         | Popup::PortForwardCreate(dialog) => {
             let mut lines: Vec<Line> = Vec::new();
@@ -3878,7 +3812,7 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             ]));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                " Enter=Create  Esc=Cancel",
+                " Enter confirms  Esc=Cancel",
                 Style::default().fg(Color::DarkGray),
             )));
 
@@ -3890,16 +3824,8 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             let paragraph = Paragraph::new(lines).block(block);
             f.render_widget(paragraph, area);
         },
-        | Popup::ConfirmDelete {
-            name,
-            resource_type,
-            crd_info,
-            ..
-        } => {
-            let display = crd_info
-                .as_ref()
-                .map(|c| c.kind.as_str())
-                .unwrap_or_else(|| resource_type.display_name());
+        | Popup::ConfirmDelete { name, kind, .. } => {
+            let display = kind.display_name();
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -3983,7 +3909,7 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 Line::from(""),
                 Line::from(format!("  Job name: {}▎", buf)),
                 Line::from(""),
-                Line::from("  [Enter] create  [Esc] cancel"),
+                Line::from("  [Enter] confirm create  [Esc] cancel"),
             ];
 
             let block = Block::default()
@@ -4010,7 +3936,7 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             lines.push(Line::from(""));
             lines.push(Line::from(format!("  New replicas: {}▎", buf)));
             lines.push(Line::from(""));
-            lines.push(Line::from("  Press [Enter] to apply, [Esc] to cancel"));
+            lines.push(Line::from("  [Enter] confirm count  [Esc] cancel"));
 
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -4276,6 +4202,54 @@ fn render_popup(f: &mut Frame, app: &mut App) {
 
             let paragraph = Paragraph::new(lines).block(block);
             f.render_widget(paragraph, area);
+        },
+        | Popup::AuthExpired { detail } => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Google Cloud credentials for this cluster are no longer valid.",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(Span::styled(
+                    "  Cluster calls are paused. The display will stay intact.",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from("  Log in again in another terminal:"),
+                Line::from(Span::styled(
+                    "    gcloud auth login",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("  Then press r here to retry."),
+                Line::from("  Press q to quit, log in, and start qb again."),
+            ];
+            if !detail.is_empty() {
+                lines.push(Line::from(""));
+                let shown: String = detail.chars().take(100).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  {shown}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Cluster login expired ");
+            f.render_widget(Paragraph::new(lines).block(block), area);
+        },
+        | Popup::Confirm { title, body, .. } => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(format!("  {body}"), Style::default().fg(Color::Red))),
+            ];
+            lines.push(Line::from(""));
+            lines.push(Line::from("  [Enter/y] confirm  [Esc/n] cancel"));
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(format!(" {title} "));
+            f.render_widget(Paragraph::new(lines).block(block), area);
         },
     }
 }

@@ -1,4 +1,5 @@
 use {
+    crate::k8s::FavoriteType,
     anyhow::{
         Context,
         Result,
@@ -39,7 +40,7 @@ pub struct Profile {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FavoriteEntry {
-    pub resource_type: String,
+    pub resource_type: FavoriteType,
     pub name: String,
     pub namespace: String,
     pub context: String,
@@ -83,9 +84,11 @@ pub struct SavedPortForward {
 // Config path
 // ---------------------------------------------------------------------------
 
-fn config_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
-    Ok(home.join(".config").join("qb").join("config.yaml"))
+impl QbConfig {
+    fn path() -> Result<PathBuf> {
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+        Ok(home.join(".config").join("qb").join("config.yaml"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +105,10 @@ fn config_path() -> Result<PathBuf> {
 /// - Config version newer than CLI → error.
 fn validate_version(config_version: &str) -> Result<()> {
     let cli_version = semver::Version::parse(env!("CARGO_PKG_VERSION")).context("Failed to parse CLI version")?;
+    versions_compatible(&cli_version, config_version)
+}
 
+fn versions_compatible(cli_version: &semver::Version, config_version: &str) -> Result<()> {
     // Dev build: accept anything
     if cli_version.major == 0 && cli_version.minor == 0 && cli_version.patch == 0 {
         return Ok(());
@@ -120,18 +126,15 @@ fn validate_version(config_version: &str) -> Result<()> {
                 cli_version
             );
         }
-    } else {
-        // Post-1.0: major must match
-        if cfg_version.major != cli_version.major {
-            anyhow::bail!(
-                "Config version {} is incompatible with CLI version {} (major version mismatch).",
-                cfg_version,
-                cli_version
-            );
-        }
+    } else if cfg_version.major != cli_version.major {
+        anyhow::bail!(
+            "Config version {} is incompatible with CLI version {} (major version mismatch).",
+            cfg_version,
+            cli_version
+        );
     }
 
-    if cfg_version > cli_version {
+    if cfg_version > *cli_version {
         anyhow::bail!(
             "Config version {} is newer than CLI version {}. Please upgrade qb.",
             cfg_version,
@@ -151,20 +154,30 @@ impl QbConfig {
     pub fn default_config() -> Self {
         let mut profiles = HashMap::new();
         profiles.insert("default".to_string(), Profile::default());
-        Self {
+        let mut config = Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
             active_profile: "default".to_string(),
             profiles,
+        };
+        config.normalize();
+        config
+    }
+
+    /// The active profile name always has an entry after this runs.
+    fn normalize(&mut self) {
+        if self.active_profile.is_empty() {
+            self.active_profile = "default".to_string();
         }
+        self.profiles.entry(self.active_profile.clone()).or_default();
     }
 
     /// Load config from `~/.config/qb/config.yaml`. Creates a default config
     /// if the file doesn't exist.
     pub fn load() -> Result<Self> {
-        let path = config_path()?;
+        let path = Self::path()?;
 
         if !path.exists() {
-            let config = Self::default_config();
+            let mut config = Self::default_config();
             config.save()?;
             return Ok(config);
         }
@@ -172,17 +185,19 @@ impl QbConfig {
         let contents =
             std::fs::read_to_string(&path).with_context(|| format!("Failed to read config: {}", path.display()))?;
 
-        let config: QbConfig =
+        let mut config: QbConfig =
             serde_yaml::from_str(&contents).with_context(|| format!("Failed to parse config: {}", path.display()))?;
 
         validate_version(&config.version)?;
+        config.normalize();
 
         Ok(config)
     }
 
     /// Save config to `~/.config/qb/config.yaml`.
-    pub fn save(&self) -> Result<()> {
-        let path = config_path()?;
+    pub fn save(&mut self) -> Result<()> {
+        self.normalize();
+        let path = Self::path()?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -195,18 +210,28 @@ impl QbConfig {
         Ok(())
     }
 
-    /// Get the active profile, creating a default one if it doesn't exist.
+    /// Active profile. `load`, `default_config`, and `save` keep the name
+    /// mapped.
     pub fn active_profile(&self) -> &Profile {
-        self.profiles.get(&self.active_profile).unwrap_or_else(|| {
-            // Should never happen since we always ensure default exists
-            static DEFAULT: Profile = Profile {
-                kubeconfig: None,
-                context: None,
-                favorites: Vec::new(),
-                port_forwards: Vec::new(),
-            };
-            &DEFAULT
-        })
+        self.profiles
+            .get(&self.active_profile)
+            .expect("active profile is inserted by QbConfig::normalize")
+    }
+
+    /// Switch to an existing profile. Returns false if `name` is not stored.
+    pub fn activate(&mut self, name: &str) -> bool {
+        if !self.profiles.contains_key(name) {
+            return false;
+        }
+        self.active_profile = name.to_string();
+        true
+    }
+
+    /// Copy the active profile under `name` and make it active.
+    pub fn save_as(&mut self, name: String) {
+        let profile = self.active_profile().clone();
+        self.profiles.insert(name.clone(), profile);
+        self.active_profile = name;
     }
 
     /// Get a mutable reference to the active profile, creating it if needed.
@@ -223,15 +248,21 @@ impl QbConfig {
 
 impl Profile {
     /// Check if a resource is in the favorites list.
-    pub fn is_favorite(&self, resource_type: &str, name: &str, namespace: &str, context: &str) -> bool {
+    pub fn is_favorite(&self, resource_type: &FavoriteType, name: &str, namespace: &str, context: &str) -> bool {
         self.favorites.iter().any(|f| {
-            f.resource_type == resource_type && f.name == name && f.namespace == namespace && f.context == context
+            &f.resource_type == resource_type && f.name == name && f.namespace == namespace && f.context == context
         })
     }
 
     /// Toggle a resource as a favorite. Returns true if added, false if
     /// removed.
-    pub fn toggle_favorite(&mut self, resource_type: String, name: String, namespace: String, context: String) -> bool {
+    pub fn toggle_favorite(
+        &mut self,
+        resource_type: FavoriteType,
+        name: String,
+        namespace: String,
+        context: String,
+    ) -> bool {
         let entry = FavoriteEntry {
             resource_type,
             name,
@@ -249,25 +280,93 @@ impl Profile {
 
     /// Add a saved port forward.
     pub fn add_port_forward(&mut self, pf: SavedPortForward) {
-        // Don't duplicate
-        if !self.port_forwards.iter().any(|existing| {
-            existing.resource.name == pf.resource.name
-                && existing.namespace == pf.namespace
-                && existing.context == pf.context
-                && existing.port.local_port == pf.port.local_port
-                && existing.port.remote_port == pf.port.remote_port
-        }) {
+        if !self.port_forwards.iter().any(|existing| existing.same_endpoint(&pf)) {
             self.port_forwards.push(pf);
         }
     }
 
     /// Remove a saved port forward by matching key fields.
     pub fn remove_port_forward(&mut self, resource_name: &str, namespace: &str, context: &str, local_port: u16) {
-        self.port_forwards.retain(|pf| {
-            !(pf.resource.name == resource_name
-                && pf.namespace == namespace
-                && pf.context == context
-                && pf.port.local_port == local_port)
-        });
+        self.port_forwards
+            .retain(|pf| !pf.matches(resource_name, namespace, context, local_port));
+    }
+}
+
+impl SavedPortForward {
+    pub fn matches(&self, resource_name: &str, namespace: &str, context: &str, local_port: u16) -> bool {
+        self.resource.name == resource_name
+            && self.namespace == namespace
+            && self.context == context
+            && self.port.local_port == local_port
+    }
+
+    fn same_endpoint(&self, other: &Self) -> bool {
+        self.resource.name == other.resource.name
+            && self.namespace == other.namespace
+            && self.context == other.context
+            && self.port.local_port == other.port.local_port
+            && self.port.remote_port == other.port.remote_port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ver(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn version_rules() {
+        assert!(versions_compatible(&ver("0.0.0"), "9.9.9").is_ok());
+        assert!(versions_compatible(&ver("0.2.4"), "0.2.0").is_ok());
+        assert!(versions_compatible(&ver("0.2.0"), "0.2.4").is_err());
+        assert!(versions_compatible(&ver("0.2.0"), "0.3.0").is_err());
+        assert!(versions_compatible(&ver("1.4.0"), "1.2.0").is_ok());
+        assert!(versions_compatible(&ver("1.4.0"), "2.0.0").is_err());
+        assert!(versions_compatible(&ver("1.4.0"), "1.5.0").is_err());
+        assert!(versions_compatible(&ver("1.4.0"), "not-a-version").is_err());
+    }
+
+    #[test]
+    fn saved_port_forward_keeps_flat_yaml_fields() {
+        let pf = SavedPortForward {
+            resource: SavedPfResource {
+                r#type: "deployment".into(),
+                name: "api".into(),
+            },
+            namespace: "prod".into(),
+            context: "kind".into(),
+            port: SavedPfPorts {
+                local_port: 8080,
+                remote_port: 80,
+            },
+            target: SavedPfTarget {
+                target_type: "label_selector".into(),
+                selector: "app=api".into(),
+            },
+            paused: false,
+        };
+        let yaml = serde_yaml::to_string(&pf).unwrap();
+        assert!(yaml.contains("resource_type: deployment"));
+        assert!(yaml.contains("resource_name: api"));
+        assert!(yaml.contains("local_port: 8080"));
+        assert!(yaml.contains("target_type: label_selector"));
+        assert!(!yaml.contains("resource:"));
+        let back: SavedPortForward = serde_yaml::from_str(&yaml).unwrap();
+        assert!(back.matches("api", "prod", "kind", 8080));
+    }
+
+    #[test]
+    fn normalize_inserts_missing_active_profile() {
+        let mut config = QbConfig {
+            version: "0.0.0".into(),
+            active_profile: "missing".into(),
+            profiles: HashMap::new(),
+        };
+        config.normalize();
+        assert!(config.profiles.contains_key("missing"));
+        assert!(config.active_profile().favorites.is_empty());
     }
 }

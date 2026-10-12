@@ -62,6 +62,124 @@ use {
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn shell_quote(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '@' | '+')))
+    {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    } else {
+        value.to_string()
+    }
+}
+
+fn sanitize_terminal_text(message: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut chars = message.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch.is_control() {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+        if out.chars().count() >= max_chars {
+            break;
+        }
+    }
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max_chars {
+        collapsed.chars().take(max_chars).collect()
+    } else {
+        collapsed
+    }
+}
+
+/// Why a cluster call failed. Auth is a typed kube failure, not a text search.
+#[derive(Clone, Debug)]
+pub enum ClusterFailure {
+    /// Exec plugin failed, or the apiserver rejected the token (401 /
+    /// Unauthorized).
+    AuthExpired {
+        detail: String,
+    },
+    Other {
+        detail: String,
+    },
+}
+
+impl ClusterFailure {
+    pub fn other(detail: impl Into<String>) -> Self {
+        Self::Other {
+            detail: sanitize_terminal_text(&detail.into(), 240),
+        }
+    }
+
+    pub fn from_anyhow(err: anyhow::Error) -> Self {
+        Self::classify(auth_in_chain(&err), sanitize_terminal_text(&format!("{err:#}"), 240))
+    }
+
+    pub fn from_kube(err: &kube::Error) -> Self {
+        Self::classify(kube_is_auth(err), sanitize_terminal_text(&err.to_string(), 240))
+    }
+
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Self::AuthExpired { .. })
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            | Self::AuthExpired { detail } | Self::Other { detail } => detail,
+        }
+    }
+
+    pub fn context(self, prefix: &str) -> Self {
+        let detail = sanitize_terminal_text(&format!("{prefix}: {}", self.detail()), 240);
+        match self {
+            | Self::AuthExpired { .. } => Self::AuthExpired { detail },
+            | Self::Other { .. } => Self::Other { detail },
+        }
+    }
+
+    fn classify(auth: bool, detail: String) -> Self {
+        if auth {
+            Self::AuthExpired { detail }
+        } else {
+            Self::Other { detail }
+        }
+    }
+}
+
+fn auth_in_chain(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<kube::Error>().is_some_and(kube_is_auth)
+            || cause.downcast_ref::<kube::client::AuthError>().is_some()
+    })
+}
+
+fn kube_is_auth(err: &kube::Error) -> bool {
+    match err {
+        | kube::Error::Auth(_) => true,
+        | kube::Error::Api(status) => is_unauthorized(status),
+        | _ => false,
+    }
+}
+
+fn is_unauthorized(status: &kube::core::Status) -> bool {
+    status.code == 401 || status.reason == kube::core::response::reason::UNAUTHORIZED
+}
+
 fn apply_timeouts(config: &mut kube::Config) {
     config.connect_timeout = Some(REQUEST_TIMEOUT);
     config.read_timeout = Some(REQUEST_TIMEOUT);
@@ -122,6 +240,10 @@ impl CrdInfo {
         }
         headers.push("AGE".to_string());
         headers
+    }
+
+    pub fn matches_gvk(&self, api_version: &str, kind: &str) -> bool {
+        self.kind == kind && self.api_resource().api_version == api_version
     }
 }
 
@@ -322,6 +444,24 @@ impl ResourceType {
         matches!(self, Self::Pod)
     }
 
+    pub fn supports_restart(&self) -> bool {
+        matches!(self, Self::Deployment | Self::StatefulSet | Self::DaemonSet)
+    }
+
+    pub fn supports_port_forward(&self) -> bool {
+        matches!(
+            self,
+            Self::Service
+                | Self::Deployment
+                | Self::StatefulSet
+                | Self::DaemonSet
+                | Self::ReplicaSet
+                | Self::Pod
+                | Self::Job
+                | Self::CronJob
+        )
+    }
+
     pub fn is_cluster_scoped(&self) -> bool {
         matches!(
             self,
@@ -407,6 +547,70 @@ impl ResourceType {
             ]),
         ]
     }
+
+    pub fn category(self) -> Category {
+        match self {
+            | Self::Deployment
+            | Self::StatefulSet
+            | Self::DaemonSet
+            | Self::ReplicaSet
+            | Self::Pod
+            | Self::CronJob
+            | Self::Job
+            | Self::HorizontalPodAutoscaler => Category::Workloads,
+            | Self::ConfigMap | Self::Secret => Category::Config,
+            | Self::Service | Self::Ingress | Self::Endpoints | Self::NetworkPolicy => Category::Network,
+            | Self::PersistentVolumeClaim | Self::PersistentVolume | Self::StorageClass => Category::Storage,
+            | Self::ServiceAccount | Self::Role | Self::RoleBinding | Self::ClusterRole | Self::ClusterRoleBinding => {
+                Category::Rbac
+            },
+            | Self::Node | Self::Namespace | Self::Event | Self::CustomResourceDefinition => Category::Cluster,
+        }
+    }
+
+    /// Abbreviated label for compact tables (favorites, port-forward type
+    /// column).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            | Self::Deployment => "Deploy",
+            | Self::StatefulSet => "StatefulSet",
+            | Self::DaemonSet => "DaemonSet",
+            | Self::ReplicaSet => "ReplicaSet",
+            | Self::Pod => "Pod",
+            | Self::CronJob => "CronJob",
+            | Self::Job => "Job",
+            | Self::HorizontalPodAutoscaler => "HPA",
+            | Self::ConfigMap => "ConfigMap",
+            | Self::Secret => "Secret",
+            | Self::Service => "Service",
+            | Self::Ingress => "Ingress",
+            | Self::Endpoints => "Endpoints",
+            | Self::NetworkPolicy => "NetPolicy",
+            | Self::PersistentVolumeClaim => "PVC",
+            | Self::PersistentVolume => "PV",
+            | Self::StorageClass => "StorageClass",
+            | Self::ServiceAccount => "SA",
+            | Self::Role => "Role",
+            | Self::RoleBinding => "RoleBinding",
+            | Self::ClusterRole => "ClusterRole",
+            | Self::ClusterRoleBinding => "CRBinding",
+            | Self::Node => "Node",
+            | Self::Namespace => "Namespace",
+            | Self::Event => "Event",
+            | Self::CustomResourceDefinition => "CRD",
+        }
+    }
+
+    /// Match a builtin type by the `apiVersion` and `kind` written in YAML.
+    pub fn from_gvk(api_version: &str, kind: &str) -> Option<Self> {
+        Self::all_by_category()
+            .into_iter()
+            .flat_map(|(_, types)| types)
+            .find(|rt| {
+                let ar = rt.api_resource();
+                ar.kind == kind && ar.api_version == api_version
+            })
+    }
 }
 
 impl Category {
@@ -419,6 +623,119 @@ impl Category {
             | Self::Rbac => "RBAC",
             | Self::Cluster => "Cluster",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource kind — builtin type or a discovered custom resource.
+// One value, so callers cannot pair a dummy ResourceType with a CrdInfo.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    Builtin(ResourceType),
+    Custom(CrdInfo),
+}
+
+impl ResourceKind {
+    pub fn builtin(&self) -> Option<ResourceType> {
+        match self {
+            | Self::Builtin(rt) => Some(*rt),
+            | Self::Custom(_) => None,
+        }
+    }
+
+    pub fn crd(&self) -> Option<&CrdInfo> {
+        match self {
+            | Self::Custom(crd) => Some(crd),
+            | Self::Builtin(_) => None,
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            | Self::Builtin(rt) => rt.display_name(),
+            | Self::Custom(crd) => crd.display_name.as_str(),
+        }
+    }
+
+    pub fn column_headers(&self) -> Vec<String> {
+        match self {
+            | Self::Builtin(rt) => rt.column_headers().into_iter().map(str::to_string).collect(),
+            | Self::Custom(crd) => crd.column_headers(),
+        }
+    }
+
+    pub fn is_event(&self) -> bool {
+        matches!(self.builtin(), Some(ResourceType::Event))
+    }
+
+    pub fn is_cluster_scoped(&self) -> bool {
+        match self {
+            | Self::Builtin(rt) => rt.is_cluster_scoped(),
+            | Self::Custom(crd) => crd.is_cluster_scoped(),
+        }
+    }
+
+    pub fn api_resource(&self) -> kube::api::ApiResource {
+        match self {
+            | Self::Builtin(rt) => rt.api_resource(),
+            | Self::Custom(crd) => crd.api_resource(),
+        }
+    }
+
+    pub fn favorite_key(&self) -> FavoriteType {
+        match self {
+            | Self::Builtin(rt) => FavoriteType::builtin(*rt),
+            | Self::Custom(crd) => FavoriteType::custom(&crd.group, &crd.plural),
+        }
+    }
+}
+
+/// Resource identity as stored in config.
+///
+/// Builtins use `ResourceType::singular_name` (`deployment`). Custom resources
+/// use `cr:{group}/{plural}` so a favorite survives without embedding the full
+/// CRD. Unknown strings are preserved so a newer config is not dropped on save.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct FavoriteType(String);
+
+impl FavoriteType {
+    pub fn builtin(rt: ResourceType) -> Self {
+        Self(rt.singular_name().to_string())
+    }
+
+    pub fn custom(group: &str, plural: &str) -> Self {
+        Self(format!("cr:{group}/{plural}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn builtin_type(&self) -> Option<ResourceType> {
+        ResourceType::from_singular_name(&self.0)
+    }
+
+    pub fn custom_ref(&self) -> Option<(&str, &str)> {
+        self.0.strip_prefix("cr:")?.split_once('/')
+    }
+
+    pub fn short_label(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(rt) = self.builtin_type() {
+            return std::borrow::Cow::Borrowed(rt.short_label());
+        }
+        if let Some((_, plural)) = self.custom_ref() {
+            return std::borrow::Cow::Borrowed(plural);
+        }
+        std::borrow::Cow::Borrowed("Resource")
+    }
+}
+
+impl std::fmt::Display for FavoriteType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -526,7 +843,6 @@ pub struct ClusterResources {
     pub mem_capacity_bytes: f64,
     pub mem_allocatable_bytes: f64,
     pub pod_capacity: usize,
-    pub pod_allocatable: usize,
 }
 
 pub struct TopRestartingPod {
@@ -569,7 +885,6 @@ pub struct PodResourceSpec {
 
 #[derive(Clone)]
 pub struct PodMetricsEntry {
-    pub name: String,
     pub namespace: String,
     pub cpu_cores: f64,
     pub memory_bytes: f64,
@@ -635,6 +950,7 @@ pub struct ClusterStatsData {
 // Kubernetes client
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct KubeClients {
     /// Standard client with connect/read/write timeouts.
     pub default: Client,
@@ -643,16 +959,19 @@ pub struct KubeClients {
     pub streaming: Client,
 }
 
+#[derive(Clone)]
 pub struct KubeconfigState {
     pub config: Kubeconfig,
     pub path: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct KubeContext {
     pub name: String,
     pub namespace: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct KubeClient {
     pub client: KubeClients,
     pub kubeconfig: KubeconfigState,
@@ -669,7 +988,7 @@ impl KubeClient {
         let path = kubeconfig_path.or_else(|| {
             std::env::var("KUBECONFIG")
                 .ok()
-                .or_else(|| std::env::home_dir().map(|h| h.join(".kube/config").to_string_lossy().into_owned()))
+                .or_else(|| dirs::home_dir().map(|h| h.join(".kube/config").to_string_lossy().into_owned()))
         });
         let config = match &path {
             | Some(p) => Kubeconfig::read_from(p).context("Failed to read kubeconfig")?,
@@ -684,7 +1003,7 @@ impl KubeClient {
             context: Some(name.clone()),
             ..Default::default()
         };
-        let client = Self::build_clients(&options).await?;
+        let client = Self::build_clients(&config, &options).await?;
 
         Ok(Self {
             client,
@@ -697,14 +1016,16 @@ impl KubeClient {
         self.kubeconfig.config.contexts.iter().map(|c| c.name.clone()).collect()
     }
 
-    async fn build_clients(options: &KubeConfigOptions) -> Result<KubeClients> {
-        let mut config = kube::Config::from_kubeconfig(options)
+    async fn build_clients(kubeconfig: &Kubeconfig, options: &KubeConfigOptions) -> Result<KubeClients> {
+        let mut silenced = kubeconfig.clone();
+        Self::silence_exec_plugins(&mut silenced);
+        let mut config = kube::Config::from_custom_kubeconfig(silenced.clone(), options)
             .await
             .context("Failed to build kube config from kubeconfig")?;
         apply_timeouts(&mut config);
         let default = Client::try_from(config)?;
 
-        let mut stream_config = kube::Config::from_kubeconfig(options)
+        let mut stream_config = kube::Config::from_custom_kubeconfig(silenced, options)
             .await
             .context("Failed to build kube config from kubeconfig")?;
         stream_config.connect_timeout = Some(REQUEST_TIMEOUT);
@@ -715,12 +1036,47 @@ impl KubeClient {
         Ok(KubeClients { default, streaming })
     }
 
+    /// Credential plugins (gcloud, gke-gcloud-auth-plugin) inherit this process
+    /// when kube marks them interactive. Their prompts and ANSI errors are what
+    /// tear down the alternate screen. Force non-interactive and drop stderr.
+    /// The user's kubeconfig file is not modified.
+    pub fn silence_exec_plugins(config: &mut Kubeconfig) {
+        // Also covers the legacy gcp auth-provider command, which inherits this
+        // process.
+        std::env::set_var("CLOUDSDK_CORE_DISABLE_PROMPTS", "1");
+        for named in &mut config.auth_infos {
+            let Some(exec) = named.auth_info.as_mut().and_then(|info| info.exec.as_mut()) else {
+                continue;
+            };
+            exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
+            let Some(command) = exec.command.clone().filter(|cmd| !cmd.is_empty()) else {
+                continue;
+            };
+            if command == "sh" {
+                continue;
+            }
+            let mut parts = vec![shell_quote(&command)];
+            if let Some(args) = &exec.args {
+                parts.extend(args.iter().map(|arg| shell_quote(arg)));
+            }
+            // ponytail: sh redirect. kube still inherits stderr unless the child closes it.
+            let script = format!("CLOUDSDK_CORE_DISABLE_PROMPTS=1 exec {} 2>/dev/null", parts.join(" "));
+            exec.command = Some("sh".into());
+            exec.args = Some(vec!["-c".into(), script]);
+        }
+    }
+
+    /// One line, no ANSI, no controls. Safe to draw in the TUI.
+    pub fn display_error(message: &str) -> String {
+        sanitize_terminal_text(message, 240)
+    }
+
     pub async fn switch_context(&mut self, ctx: &str) -> Result<()> {
         let options = KubeConfigOptions {
             context: Some(ctx.to_string()),
             ..Default::default()
         };
-        self.client = Self::build_clients(&options).await?;
+        self.client = Self::build_clients(&self.kubeconfig.config, &options).await?;
         self.context.namespace = None;
         self.context.name = ctx.to_string();
         Ok(())
@@ -819,7 +1175,6 @@ impl KubeClient {
         let mut total_mem_cap = 0.0f64;
         let mut total_mem_alloc = 0.0f64;
         let mut total_pod_cap = 0usize;
-        let mut total_pod_alloc = 0usize;
         let mut pressure = PressureDetail {
             disk_pressure: 0,
             memory_pressure: 0,
@@ -896,7 +1251,6 @@ impl KubeClient {
             total_mem_cap += parse_memory_bytes(&mem_cap_raw);
             total_mem_alloc += parse_memory_bytes(&mem_alloc_raw);
             total_pod_cap += pod_cap_raw.parse::<usize>().unwrap_or(0);
-            total_pod_alloc += pod_alloc_raw.parse::<usize>().unwrap_or(0);
 
             let unschedulable = n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false);
             let node_status = match (is_ready, unschedulable) {
@@ -1126,7 +1480,6 @@ impl KubeClient {
                 mem_capacity_bytes: total_mem_cap,
                 mem_allocatable_bytes: total_mem_alloc,
                 pod_capacity: total_pod_cap,
-                pod_allocatable: total_pod_alloc,
             },
             top_restarting: restart_pods,
             warning_details,
@@ -1232,12 +1585,12 @@ impl KubeClient {
                 let cpu = usage
                     .and_then(|u| u.get("cpu"))
                     .and_then(|v| v.as_str())
-                    .map(|s| parse_cpu_cores(s))
+                    .map(parse_cpu_cores)
                     .unwrap_or(0.0);
                 let mem = usage
                     .and_then(|u| u.get("memory"))
                     .and_then(|v| v.as_str())
-                    .map(|s| parse_memory_bytes(s))
+                    .map(parse_memory_bytes)
                     .unwrap_or(0.0);
                 total_cpu += cpu;
                 total_mem += mem;
@@ -1264,12 +1617,12 @@ impl KubeClient {
                         cpu += usage
                             .and_then(|u| u.get("cpu"))
                             .and_then(|v| v.as_str())
-                            .map(|s| parse_cpu_cores(s))
+                            .map(parse_cpu_cores)
                             .unwrap_or(0.0);
                         mem += usage
                             .and_then(|u| u.get("memory"))
                             .and_then(|v| v.as_str())
-                            .map(|s| parse_memory_bytes(s))
+                            .map(parse_memory_bytes)
                             .unwrap_or(0.0);
                     }
                 }
@@ -1280,7 +1633,6 @@ impl KubeClient {
                     .unwrap_or_else(|| (PodResourceSpec::default(), name.clone(), "Pod".into()));
 
                 PodMetricsEntry {
-                    name,
                     namespace,
                     cpu_cores: cpu,
                     memory_bytes: mem,
@@ -1404,36 +1756,40 @@ impl KubeClient {
 
     // -- Edit / replace resource -----------------------------------------------
 
-    /// Replace a resource with edited YAML. Uses the kube dynamic API so it
-    /// works for any resource type without per-type match arms.
-    pub async fn replace_resource_yaml(&self, rt: ResourceType, ns: &str, name: &str, yaml: &str) -> Result<Value> {
-        let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML")?;
-        let ar = rt.api_resource();
-        let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
-            Api::all_with(self.client.default.clone(), &ar)
+    fn dynamic_api(
+        &self,
+        ar: &kube::api::ApiResource,
+        cluster_scoped: bool,
+        ns: &str,
+    ) -> Api<kube::api::DynamicObject> {
+        if cluster_scoped {
+            Api::all_with(self.client.default.clone(), ar)
         } else {
-            Api::namespaced_with(self.client.default.clone(), ns, &ar)
-        };
-        let pp = kube::api::PostParams::default();
-        let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
-        let val = serde_json::to_value(&result)?;
-        Ok(val)
+            Api::namespaced_with(self.client.default.clone(), ns, ar)
+        }
     }
 
-    pub async fn patch_metadata(
+    /// Replace a resource with edited YAML. Uses the kube dynamic API so it
+    /// works for any resource type without per-type match arms.
+    pub async fn replace_kind_yaml(&self, kind: &ResourceKind, ns: &str, name: &str, yaml: &str) -> Result<Value> {
+        let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML")?;
+        let ar = kind.api_resource();
+        let api = self.dynamic_api(&ar, kind.is_cluster_scoped(), ns);
+        let pp = kube::api::PostParams::default();
+        let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
+        Ok(serde_json::to_value(&result)?)
+    }
+
+    pub async fn patch_kind_metadata(
         &self,
-        rt: ResourceType,
+        kind: &ResourceKind,
         ns: &str,
         name: &str,
         labels: Option<&serde_json::Map<String, Value>>,
         annotations: Option<&serde_json::Map<String, Value>>,
     ) -> Result<Value> {
-        let ar = rt.api_resource();
-        let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
-            Api::all_with(self.client.default.clone(), &ar)
-        } else {
-            Api::namespaced_with(self.client.default.clone(), ns, &ar)
-        };
+        let ar = kind.api_resource();
+        let api = self.dynamic_api(&ar, kind.is_cluster_scoped(), ns);
         let mut metadata = serde_json::Map::new();
         if let Some(l) = labels {
             metadata.insert("labels".into(), Value::Object(l.clone()));
@@ -1473,11 +1829,16 @@ impl KubeClient {
         Ok(())
     }
 
-    pub async fn create_resource_yaml(&self, yaml: &str) -> Result<Value> {
+    /// Create a resource from YAML.
+    ///
+    /// Builtin types and already-discovered CRDs supply the plural and scope.
+    /// Anything else is resolved with a single discovery call — guessing
+    /// `kind + "s"` sends Ingress, StorageClass, and most CRDs to the wrong
+    /// URL, and always using the namespaced client rejects cluster-scoped
+    /// creates.
+    pub async fn create_resource_yaml(&self, yaml: &str, crds: &[CrdInfo]) -> Result<Value> {
         let value: Value = serde_yaml::from_str(yaml).context("Invalid YAML")?;
 
-        // Extract apiVersion, kind, metadata from the YAML to determine the API
-        // resource
         let api_version = value.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
         let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let namespace = value
@@ -1490,51 +1851,56 @@ impl KubeClient {
             anyhow::bail!("YAML must contain apiVersion and kind");
         }
 
-        // Parse the group and version from apiVersion (e.g., "apps/v1" -> group="apps",
-        // version="v1")
-        let (group, version) = if api_version.contains('/') {
-            let parts: Vec<&str> = api_version.splitn(2, '/').collect();
-            (parts[0].to_string(), parts[1].to_string())
+        let (ar, cluster_scoped) = if let Some(rt) = ResourceType::from_gvk(api_version, kind) {
+            (rt.api_resource(), rt.is_cluster_scoped())
+        } else if let Some(crd) = crds.iter().find(|c| c.matches_gvk(api_version, kind)) {
+            (crd.api_resource(), crd.is_cluster_scoped())
         } else {
-            (String::new(), api_version.to_string())
-        };
-
-        // Build plural from kind (simple lowercase + s, covers most cases)
-        let plural = format!("{}s", kind.to_lowercase());
-
-        let ar = kube::api::ApiResource {
-            group,
-            version,
-            api_version: api_version.to_string(),
-            kind: kind.to_string(),
-            plural,
+            let (group, version) = api_version.split_once('/').unwrap_or(("", api_version));
+            let gvk = kube::api::GroupVersionKind::gvk(group, version, kind);
+            let (ar, caps) = kube::discovery::pinned_kind(&self.client.default, &gvk)
+                .await
+                .with_context(|| format!("Failed to discover {kind} ({api_version})"))?;
+            (ar, caps.scope == kube::discovery::Scope::Cluster)
         };
 
         let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML for DynamicObject")?;
-        // If no namespace in YAML, use current namespace (or "default")
-        let effective_ns = if namespace.is_empty() {
-            self.context.namespace.as_deref().unwrap_or("default")
+        let api = if cluster_scoped {
+            Api::all_with(self.client.default.clone(), &ar)
         } else {
-            namespace
+            let effective_ns = if namespace.is_empty() {
+                self.context.namespace.as_deref().unwrap_or("default")
+            } else {
+                namespace
+            };
+            Api::namespaced_with(self.client.default.clone(), effective_ns, &ar)
         };
-        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.default.clone(), effective_ns, &ar);
 
         let pp = kube::api::PostParams::default();
         let result = api.create(&pp, &obj).await.context("Failed to create resource")?;
-        let val = serde_json::to_value(&result)?;
-        Ok(val)
+        Ok(serde_json::to_value(&result)?)
     }
 
-    pub async fn delete_resource(&self, rt: ResourceType, ns: &str, name: &str) -> Result<()> {
-        let ar = rt.api_resource();
-        let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
-            Api::all_with(self.client.default.clone(), &ar)
-        } else {
-            Api::namespaced_with(self.client.default.clone(), ns, &ar)
-        };
+    pub async fn delete_kind(&self, kind: &ResourceKind, ns: &str, name: &str) -> Result<()> {
+        let ar = kind.api_resource();
+        let api = self.dynamic_api(&ar, kind.is_cluster_scoped(), ns);
         let dp = kube::api::DeleteParams::default();
         api.delete(name, &dp).await.context("Failed to delete resource")?;
         Ok(())
+    }
+
+    pub async fn list_kind(&self, kind: &ResourceKind) -> Result<Vec<ResourceEntry>> {
+        match kind {
+            | ResourceKind::Builtin(rt) => self.list_resources(*rt).await,
+            | ResourceKind::Custom(crd) => self.list_custom_resources(crd).await,
+        }
+    }
+
+    pub async fn get_kind(&self, kind: &ResourceKind, ns: &str, name: &str) -> Result<Value> {
+        match kind {
+            | ResourceKind::Builtin(rt) => self.get_resource(*rt, ns, name).await,
+            | ResourceKind::Custom(crd) => self.get_custom_resource(crd, ns, name).await,
+        }
     }
 
     pub async fn scale_resource(&self, rt: ResourceType, ns: &str, name: &str, replicas: u32) -> Result<()> {
@@ -3595,64 +3961,6 @@ impl KubeClient {
         let val = serde_json::to_value(&obj)?;
         strip_managed_fields(val)
     }
-
-    /// Replace a custom resource with edited YAML.
-    pub async fn replace_custom_resource(&self, crd: &CrdInfo, ns: &str, name: &str, yaml: &str) -> Result<Value> {
-        let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML")?;
-        let ar = crd.api_resource();
-        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
-            Api::all_with(self.client.default.clone(), &ar)
-        } else {
-            Api::namespaced_with(self.client.default.clone(), ns, &ar)
-        };
-        let pp = kube::api::PostParams::default();
-        let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
-        Ok(serde_json::to_value(&result)?)
-    }
-
-    /// Delete a custom resource.
-    pub async fn delete_custom_resource(&self, crd: &CrdInfo, ns: &str, name: &str) -> Result<()> {
-        let ar = crd.api_resource();
-        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
-            Api::all_with(self.client.default.clone(), &ar)
-        } else {
-            Api::namespaced_with(self.client.default.clone(), ns, &ar)
-        };
-        let dp = kube::api::DeleteParams::default();
-        api.delete(name, &dp).await.context("Failed to delete resource")?;
-        Ok(())
-    }
-
-    /// Patch metadata (labels/annotations) on a custom resource.
-    pub async fn patch_custom_resource_metadata(
-        &self,
-        crd: &CrdInfo,
-        ns: &str,
-        name: &str,
-        labels: Option<&serde_json::Map<String, Value>>,
-        annotations: Option<&serde_json::Map<String, Value>>,
-    ) -> Result<Value> {
-        let ar = crd.api_resource();
-        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
-            Api::all_with(self.client.default.clone(), &ar)
-        } else {
-            Api::namespaced_with(self.client.default.clone(), ns, &ar)
-        };
-        let mut metadata = serde_json::Map::new();
-        if let Some(l) = labels {
-            metadata.insert("labels".into(), Value::Object(l.clone()));
-        }
-        if let Some(a) = annotations {
-            metadata.insert("annotations".into(), Value::Object(a.clone()));
-        }
-        let patch = serde_json::json!({ "metadata": metadata });
-        let pp = kube::api::PatchParams::default();
-        let result = api
-            .patch(name, &pp, &kube::api::Patch::Merge(&patch))
-            .await
-            .context("Failed to patch metadata")?;
-        Ok(serde_json::to_value(&result)?)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3830,4 +4138,114 @@ fn strip_managed_fields(mut val: Value) -> Result<Value> {
         }
     }
     Ok(val)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gvk_uses_api_plural_not_a_suffix_guess() {
+        let ingress = ResourceType::Ingress.api_resource();
+        assert_eq!(ingress.plural, "ingresses");
+        assert_eq!(ingress.api_version, "networking.k8s.io/v1");
+        assert_eq!(
+            ResourceType::from_gvk("networking.k8s.io/v1", "Ingress"),
+            Some(ResourceType::Ingress)
+        );
+
+        let sc = ResourceType::StorageClass.api_resource();
+        assert_eq!(sc.plural, "storageclasses");
+        assert!(sc.kind != "storageclasss");
+        assert!(ResourceType::StorageClass.is_cluster_scoped());
+        assert!(!ResourceType::Ingress.is_cluster_scoped());
+    }
+
+    #[test]
+    fn favorite_type_round_trips_builtin_and_custom_keys() {
+        let deploy = FavoriteType::builtin(ResourceType::Deployment);
+        assert_eq!(deploy.as_str(), "deployment");
+        assert_eq!(deploy.builtin_type(), Some(ResourceType::Deployment));
+        assert_eq!(deploy.short_label().as_ref(), "Deploy");
+
+        let cert = FavoriteType::custom("cert-manager.io", "certificates");
+        assert_eq!(cert.as_str(), "cr:cert-manager.io/certificates");
+        assert_eq!(cert.custom_ref(), Some(("cert-manager.io", "certificates")));
+        assert_eq!(cert.short_label().as_ref(), "certificates");
+        assert!(cert.builtin_type().is_none());
+
+        let yaml = serde_yaml::to_string(&deploy).unwrap();
+        assert!(yaml.contains("deployment"));
+        let back: FavoriteType = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, deploy);
+    }
+
+    #[test]
+    fn quantity_parsers_accept_k8s_suffixes() {
+        assert_eq!(parse_cpu_cores("250m"), 0.25);
+        assert_eq!(parse_cpu_cores("2"), 2.0);
+        assert_eq!(parse_memory_bytes("1Ki"), 1024.0);
+        assert_eq!(parse_memory_bytes("1Mi"), 1024.0 * 1024.0);
+        assert_eq!(parse_memory_bytes("-"), 0.0);
+    }
+
+    #[test]
+    fn auth_expiry_is_the_kube_auth_error_or_http_401() {
+        let plugin = kube::Error::Auth(kube::client::AuthError::ExecPluginFailed);
+        assert!(ClusterFailure::from_kube(&plugin).is_auth());
+
+        let unauthorized = kube::Error::Api(
+            kube::core::Status::failure("token rejected", kube::core::response::reason::UNAUTHORIZED)
+                .with_code(401)
+                .boxed(),
+        );
+        assert!(ClusterFailure::from_kube(&unauthorized).is_auth());
+
+        let forbidden = kube::Error::Api(
+            kube::core::Status::failure("pods is forbidden", kube::core::response::reason::FORBIDDEN)
+                .with_code(403)
+                .boxed(),
+        );
+        assert!(!ClusterFailure::from_kube(&forbidden).is_auth());
+
+        let prose = anyhow::anyhow!("Error from server (Unauthorized): Unauthorized");
+        assert!(!ClusterFailure::from_anyhow(prose).is_auth());
+    }
+
+    #[test]
+    fn display_error_strips_ansi_and_does_not_split_a_char() {
+        let raw = "fail \u{1b}[31mnow\u{1b}[0m\nline two — tail";
+        let shown = KubeClient::display_error(raw);
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\n'));
+        assert!(shown.contains("fail now line two"));
+        let sliced = sanitize_terminal_text("éééé", 2);
+        assert_eq!(sliced, "éé");
+    }
+
+    #[test]
+    fn exec_plugin_stderr_is_redirected_and_not_saved_as_interactive() {
+        let mut config: Kubeconfig = serde_yaml::from_str(
+            r#"
+users:
+- name: gke
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: gke-gcloud-auth-plugin
+      args: ["--flag", "bar baz"]
+      interactiveMode: IfAvailable
+"#,
+        )
+        .unwrap();
+        KubeClient::silence_exec_plugins(&mut config);
+        let exec = config.auth_infos[0].auth_info.as_ref().unwrap().exec.as_ref().unwrap();
+        assert_eq!(exec.command.as_deref(), Some("sh"));
+        assert_eq!(exec.interactive_mode, Some(kube::config::ExecInteractiveMode::Never));
+        let script = exec.args.as_ref().unwrap()[1].as_str();
+        assert!(script.contains("gke-gcloud-auth-plugin"));
+        assert!(script.contains("'bar baz'"));
+        assert!(script.contains("2>/dev/null"));
+        assert!(script.contains("CLOUDSDK_CORE_DISABLE_PROMPTS=1"));
+    }
 }

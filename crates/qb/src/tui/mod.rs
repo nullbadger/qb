@@ -1,5 +1,6 @@
 pub mod app;
 pub mod command;
+pub mod jobs;
 pub mod logs;
 pub mod smart;
 pub mod ui;
@@ -43,7 +44,7 @@ async fn run_tui(kube_client: KubeClient, experimental: bool, config: QbConfig) 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (result, config) = run_event_loop(&mut terminal, kube_client, experimental, config).await;
+    let (result, mut config) = run_event_loop(&mut terminal, kube_client, experimental, config).await;
 
     if let Err(e) = config.save() {
         eprintln!("Warning: Failed to save config: {}", e);
@@ -74,37 +75,43 @@ async fn run_event_loop_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdou
     };
 
     let mut event_stream = EventStream::new();
+    let mut wake = jobs::WakeClock::new();
 
     loop {
+        // A wall-clock jump with a frozen monotonic clock is a sleep/wake.
+        // Drop streams before drawing or polling so a backlog is never parsed.
+        if wake.jumped(std::time::Duration::from_secs(2)) {
+            app.on_wake();
+        }
+
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Process deferred loads after rendering
-        app.process_pending_load().await;
-
-        // Poll background cluster stats and metrics (non-blocking)
+        // Apply finished background work. Never await cluster I/O here.
+        let held = app.auth_blocked();
+        app.poll_jobs();
         app.poll_cluster_stats();
         app.poll_metrics();
-
-        // Poll log stream for new lines
         app.poll_log_stream();
-
-        // Poll port forward status updates
         app.poll_port_forwards();
-
-        // Check if auto-refresh is due
         app.maybe_auto_refresh();
+        app.kick_pending();
+        // Draw the login prompt on this tick, not after the next key.
+        if app.auth_blocked() && !held {
+            terminal.draw(|f| ui::render(f, app))?;
+        }
 
         // Wait for input or tick (50ms timeout for UI responsiveness)
         tokio::select! {
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event::Event::Key(key))) = maybe_event {
                     if key.kind == event::KeyEventKind::Press {
-                        app.handle_key(key).await;
+                        app.handle_key(key);
                     }
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
+        app.kick_pending();
 
         // Handle pending editor invocation — suspend TUI, run editor, resume
         if let Some(edit) = app.pending_edit.take() {
@@ -121,14 +128,14 @@ async fn run_event_loop_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdou
         // Handle pending create — suspend TUI, open editor, apply on save
         if let Some(create) = app.pending_create.take() {
             if let Some(yaml) = run_create_editor(terminal, app, create)? {
-                app.handle_create_result(yaml).await;
+                app.handle_create_result(yaml);
             }
         }
 
         // Handle pending metadata edit — suspend TUI, open editor, apply on save
         if let Some(meta_edit) = app.pending_metadata_edit.take() {
             if let Some((edit, edited_yaml)) = run_metadata_editor(terminal, app, meta_edit)? {
-                app.handle_metadata_edit_result(edit, edited_yaml).await;
+                app.handle_metadata_edit_result(edit, edited_yaml);
             }
         }
 
@@ -138,135 +145,120 @@ async fn run_event_loop_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdou
     }
 }
 
-/// Run $EDITOR and return (edit, edited_yaml) on success.
+enum EditorRun {
+    Saved(String),
+    Failed(String),
+}
+
+/// Suspend the TUI, run `$EDITOR` on `yaml`, and resume.
+///
+/// `$EDITOR` may include arguments (`code --wait`). Split is whitespace-only —
+/// quoted paths in the variable are not supported.
+fn run_editor(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, yaml: &str) -> Result<EditorRun> {
+    let tmp = tempfile::Builder::new().suffix(".yaml").tempfile()?;
+    std::fs::write(tmp.path(), yaml)?;
+
+    let (program, args) = resolve_editor();
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args).arg(tmp.path());
+    let status = cmd.status();
+
+    let edited = std::fs::read_to_string(tmp.path());
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    match (status, edited) {
+        | (Ok(s), Ok(text)) if s.success() => Ok(EditorRun::Saved(text)),
+        | (Ok(s), _) => Ok(EditorRun::Failed(format!("Editor exited with status: {s}"))),
+        | (Err(e), _) => Ok(EditorRun::Failed(format!("Failed to run editor '{program}': {e}"))),
+    }
+}
+
+fn resolve_editor() -> (String, Vec<String>) {
+    if let Some(split) = std::env::var("EDITOR").ok().and_then(|raw| split_editor(&raw)) {
+        return split;
+    }
+    let vim_exists = std::process::Command::new("vim")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if vim_exists {
+        ("vim".into(), Vec::new())
+    } else {
+        ("vi".into(), Vec::new())
+    }
+}
+
+fn split_editor(raw: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = raw.split_whitespace();
+    let program = parts.next()?.to_string();
+    Some((program, parts.map(str::to_string).collect()))
+}
+
 fn run_external_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
     edit: app::PendingEdit,
 ) -> Result<Option<(app::PendingEdit, String)>> {
-    // Write YAML to temp file
-    let tmp = tempfile::Builder::new().suffix(".yaml").tempfile()?;
-    std::fs::write(tmp.path(), &edit.yaml)?;
-
-    // Suspend TUI
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    // Resolve editor: $EDITOR → vim → vi
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-        if std::process::Command::new("vim").arg("--version").output().is_ok() {
-            "vim".into()
-        } else {
-            "vi".into()
-        }
-    });
-
-    // Run editor (blocking)
-    let status = std::process::Command::new(&editor).arg(tmp.path()).status();
-
-    // Read back edited content before restoring TUI
-    let edited_yaml = std::fs::read_to_string(tmp.path()).unwrap_or_default();
-
-    // Restore TUI
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    // Force full redraw
-    terminal.clear()?;
-
-    match status {
-        | Ok(s) if s.success() => Ok(Some((edit, edited_yaml))),
-        | Ok(s) => {
-            app.error = Some(format!("Editor exited with status: {}", s));
-            Ok(None)
-        },
-        | Err(e) => {
-            app.error = Some(format!("Failed to run editor '{}': {}", editor, e));
+    match run_editor(terminal, &edit.yaml)? {
+        | EditorRun::Saved(yaml) => Ok(Some((edit, yaml))),
+        | EditorRun::Failed(message) => {
+            app.error = Some(message);
             Ok(None)
         },
     }
 }
 
-/// Run $EDITOR for create and return the YAML on success.
 fn run_create_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
     create: app::PendingCreate,
 ) -> Result<Option<String>> {
-    let tmp = tempfile::Builder::new().suffix(".yaml").tempfile()?;
-    std::fs::write(tmp.path(), &create.yaml)?;
-
-    // Suspend TUI
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-        if std::process::Command::new("vim").arg("--version").output().is_ok() {
-            "vim".into()
-        } else {
-            "vi".into()
-        }
-    });
-
-    let status = std::process::Command::new(&editor).arg(tmp.path()).status();
-    let yaml = std::fs::read_to_string(tmp.path()).unwrap_or_default();
-
-    // Restore TUI
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.clear()?;
-
-    match status {
-        | Ok(s) if s.success() => Ok(Some(yaml)),
-        | Ok(s) => {
-            app.error = Some(format!("Editor exited with status: {}", s));
-            Ok(None)
-        },
-        | Err(e) => {
-            app.error = Some(format!("Failed to run editor '{}': {}", editor, e));
+    match run_editor(terminal, &create.yaml)? {
+        | EditorRun::Saved(yaml) => Ok(Some(yaml)),
+        | EditorRun::Failed(message) => {
+            app.error = Some(message);
             Ok(None)
         },
     }
 }
 
-/// Run $EDITOR for metadata edit and return (edit, edited_yaml) on success.
 fn run_metadata_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
     edit: app::PendingMetadataEdit,
 ) -> Result<Option<(app::PendingMetadataEdit, String)>> {
-    let tmp = tempfile::Builder::new().suffix(".yaml").tempfile()?;
-    std::fs::write(tmp.path(), &edit.yaml)?;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-        if std::process::Command::new("vim").arg("--version").output().is_ok() {
-            "vim".into()
-        } else {
-            "vi".into()
-        }
-    });
-
-    let status = std::process::Command::new(&editor).arg(tmp.path()).status();
-    let edited_yaml = std::fs::read_to_string(tmp.path()).unwrap_or_default();
-
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.clear()?;
-
-    match status {
-        | Ok(s) if s.success() => Ok(Some((edit, edited_yaml))),
-        | Ok(s) => {
-            app.error = Some(format!("Editor exited with status: {}", s));
+    match run_editor(terminal, &edit.yaml)? {
+        | EditorRun::Saved(yaml) => Ok(Some((edit, yaml))),
+        | EditorRun::Failed(message) => {
+            app.error = Some(message);
             Ok(None)
         },
-        | Err(e) => {
-            app.error = Some(format!("Failed to run editor '{}': {}", editor, e));
-            Ok(None)
-        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_editor;
+
+    #[test]
+    fn editor_args_split_on_whitespace() {
+        assert_eq!(
+            split_editor("code --wait"),
+            Some(("code".into(), vec!["--wait".into()]))
+        );
+        assert_eq!(split_editor("  vim  "), Some(("vim".into(), Vec::new())));
+        assert_eq!(split_editor("   "), None);
     }
 }

@@ -35,6 +35,116 @@ impl Ctx {
     }
 }
 
+/// Something the command palette can run. Keys and the palette both call
+/// `App::run_action` — the palette does not synthesize keypresses.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Action {
+    Quit,
+    Help,
+    Pause,
+    SwitchCluster,
+    SwitchNamespace,
+    OpenKubeconfig,
+    Filter,
+    ClearFilter,
+    Edit,
+    Logs,
+    PortForward,
+    Delete,
+    Restart,
+    Scale,
+    Copy,
+    Diff,
+    Create,
+    Exec,
+    Cordon,
+    Drain,
+    Trigger,
+    Star,
+    SaveProfile,
+    LoadProfile,
+    CycleView,
+    Watch,
+    Labels,
+    Annotations,
+    Expand,
+    CopyDetail,
+    Related,
+    Follow,
+    Wrap,
+    TimeRange,
+    SelectPod,
+    SelectContainer,
+    CopyLogs,
+    ApplyEdit,
+    Reedit,
+    CancelEdit,
+    CycleDiff,
+    PfPause,
+    PfCancel,
+    PfEditPort,
+    SwitchProfile,
+    CloneProfile,
+    DeleteProfile,
+    CreateProfile,
+}
+
+/// Resolve a registry row to an action. `(key, label)` is not unique, so
+/// context disambiguates the collisions.
+pub fn command_action(cmd: &Cmd) -> Option<Action> {
+    match (cmd.key, cmd.label) {
+        | ("q", "Quit") => Some(Action::Quit),
+        | ("?", "Help") => Some(Action::Help),
+        | ("p", "Pause") if cmd.contexts.contains(&Ctx::PortForwards) => Some(Action::PfPause),
+        | ("p", "Pause") | ("palette", "Pause") => Some(Action::Pause),
+        | ("c", "Cluster") => Some(Action::SwitchCluster),
+        | ("n", "Namespace") => Some(Action::SwitchNamespace),
+        | ("O", "Kubeconfig") => Some(Action::OpenKubeconfig),
+        | ("/", "Filter") => Some(Action::Filter),
+        | ("x", "Clear") => Some(Action::ClearFilter),
+        | ("e", "Edit") => Some(Action::Edit),
+        | ("e", "Re-edit") => Some(Action::Reedit),
+        | ("e", "Edit Port") => Some(Action::PfEditPort),
+        | ("l", "Logs") | ("L", "Logs") => Some(Action::Logs),
+        | ("l", "Labels") => Some(Action::Labels),
+        | ("F", "PortFwd") => Some(Action::PortForward),
+        | ("D", "Delete") if cmd.contexts.contains(&Ctx::Profiles) => Some(Action::DeleteProfile),
+        | ("D", "Delete") => Some(Action::Delete),
+        | ("R", "Restart") => Some(Action::Restart),
+        | ("S", "Scale") => Some(Action::Scale),
+        | ("y", "Copy") if cmd.contexts.contains(&Ctx::Detail) => Some(Action::CopyDetail),
+        | ("y", "Copy") => Some(Action::Copy),
+        | ("Y", "Copy") => Some(Action::CopyLogs),
+        | ("d", "Diff") => Some(Action::Diff),
+        | ("d", "Cancel") => Some(Action::PfCancel),
+        | ("C", "Create") if cmd.contexts.contains(&Ctx::Profiles) => Some(Action::CreateProfile),
+        | ("C", "Create") => Some(Action::Create),
+        | ("X", "Exec") => Some(Action::Exec),
+        | ("K", "Cordon") => Some(Action::Cordon),
+        | ("T", "Drain") => Some(Action::Drain),
+        | ("T", "Trigger") => Some(Action::Trigger),
+        | ("*", "Star") => Some(Action::Star),
+        | ("Ctrl+s", "Save Profile") => Some(Action::SaveProfile),
+        | ("P", "Load Profile") => Some(Action::LoadProfile),
+        | ("v", "View") if cmd.contexts.contains(&Ctx::EditDiff) => Some(Action::CycleDiff),
+        | ("v", "View") => Some(Action::CycleView),
+        | ("w", "Watch") => Some(Action::Watch),
+        | ("w", "Wrap") => Some(Action::Wrap),
+        | ("a", "Annotations") => Some(Action::Annotations),
+        | ("Space", "Expand") => Some(Action::Expand),
+        | ("r", "Related") => Some(Action::Related),
+        | ("f", "Follow") => Some(Action::Follow),
+        | ("t", "Time") => Some(Action::TimeRange),
+        | ("p", "Pod") => Some(Action::SelectPod),
+        | ("c", "Container") => Some(Action::SelectContainer),
+        | ("c", "Clone") => Some(Action::CloneProfile),
+        | ("Enter", "Confirm") => Some(Action::ApplyEdit),
+        | ("Esc", "Cancel") => Some(Action::CancelEdit),
+        | ("Enter", "Switch") => Some(Action::SwitchProfile),
+        | _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Command definition — single source of truth for each action
 // ---------------------------------------------------------------------------
@@ -50,7 +160,8 @@ pub struct Cmd {
     pub contexts: &'static [Ctx],
     /// Show in the hotkey bar? Navigation keys may be hidden.
     pub hotkey: bool,
-    /// Show in the command palette (> mode)?
+    /// Kept so existing rows stay explicit. The palette lists every action.
+    #[allow(dead_code)]
     pub palette: bool,
     /// Predicate: is this command available given the current state?
     /// `None` means always available. The function receives:
@@ -95,12 +206,15 @@ pub fn hotkey_bar(ctx: Ctx, flags: &CmdFlags) -> Vec<&'static Cmd> {
         .collect()
 }
 
-/// Returns commands eligible for the command palette.
-pub fn palette_commands(flags: &CmdFlags) -> Vec<&'static Cmd> {
+/// Actions available in `ctx`, one row per action. The palette runs these
+/// directly; a hotkey is optional.
+pub fn palette_commands(ctx: Ctx, flags: &CmdFlags) -> Vec<&'static Cmd> {
+    let mut seen = std::collections::HashSet::new();
     COMMANDS
         .iter()
-        .filter(|cmd| cmd.palette)
+        .filter(|cmd| cmd.contexts.contains(&ctx) || cmd.contexts.contains(&Ctx::Global))
         .filter(|cmd| cmd.available.map(|f| f(flags)).unwrap_or(true))
+        .filter(|cmd| command_action(cmd).is_some_and(|action| seen.insert(action)))
         .collect()
 }
 
@@ -138,32 +252,11 @@ fn supports_exec(f: &CmdFlags) -> bool {
 }
 
 fn supports_pf(f: &CmdFlags) -> bool {
-    f.resource_type
-        .map(|rt| {
-            matches!(
-                rt,
-                ResourceType::Service
-                    | ResourceType::Deployment
-                    | ResourceType::StatefulSet
-                    | ResourceType::DaemonSet
-                    | ResourceType::ReplicaSet
-                    | ResourceType::Pod
-                    | ResourceType::Job
-                    | ResourceType::CronJob
-            )
-        })
-        .unwrap_or(false)
+    f.resource_type.is_some_and(|rt| rt.supports_port_forward())
 }
 
 fn supports_restart(f: &CmdFlags) -> bool {
-    f.resource_type
-        .map(|rt| {
-            matches!(
-                rt,
-                ResourceType::Deployment | ResourceType::StatefulSet | ResourceType::DaemonSet
-            )
-        })
-        .unwrap_or(false)
+    f.resource_type.is_some_and(|rt| rt.supports_restart())
 }
 
 fn is_cronjob(f: &CmdFlags) -> bool {
@@ -443,12 +536,12 @@ static COMMANDS: &[Cmd] = &[
             Ctx::PortForwards,
             Ctx::Profiles,
         ],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: None,
     },
     Cmd {
-        key: "p",
+        key: "palette",
         label: "Pause",
         description: "Pause/resume auto-refresh",
         contexts: &[
@@ -459,8 +552,8 @@ static COMMANDS: &[Cmd] = &[
             Ctx::Profiles,
             Ctx::Detail,
         ],
-        hotkey: true,
-        palette: false,
+        hotkey: false,
+        palette: true,
         available: None,
     },
     Cmd {
@@ -513,7 +606,7 @@ static COMMANDS: &[Cmd] = &[
         label: "PortFwd",
         description: "Create a port forward",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(supports_pf),
     },
@@ -522,7 +615,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Delete",
         description: "Delete the selected resource",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: None,
     },
@@ -531,7 +624,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Restart",
         description: "Rollout restart workload",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(supports_restart),
     },
@@ -540,7 +633,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Scale",
         description: "Scale replicas up or down",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(supports_scale),
     },
@@ -567,7 +660,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Create",
         description: "Create a new resource from YAML",
         contexts: &[Ctx::Resources],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: None,
     },
@@ -576,7 +669,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Exec",
         description: "Exec shell into pod",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(supports_exec),
     },
@@ -585,7 +678,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Cordon",
         description: "Cordon/uncordon node (toggle scheduling)",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(is_node),
     },
@@ -594,7 +687,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Drain",
         description: "Drain node (cordon + evict pods)",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(is_node),
     },
@@ -603,7 +696,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Trigger",
         description: "Create a Job from this CronJob",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: Some(is_cronjob),
     },
@@ -757,8 +850,8 @@ static COMMANDS: &[Cmd] = &[
     // ── Edit diff ───────────────────────────────────────────────────────
     Cmd {
         key: "Enter",
-        label: "Apply",
-        description: "Apply changes to cluster",
+        label: "Confirm",
+        description: "Confirm and apply changes to the cluster",
         contexts: &[Ctx::EditDiff],
         hotkey: true,
         palette: false,
@@ -806,8 +899,8 @@ static COMMANDS: &[Cmd] = &[
         label: "Cancel",
         description: "Cancel (delete) the selected port forward",
         contexts: &[Ctx::PortForwards],
-        hotkey: true,
-        palette: false,
+        hotkey: false,
+        palette: true,
         available: Some(has_pf_entries),
     },
     Cmd {
@@ -825,7 +918,7 @@ static COMMANDS: &[Cmd] = &[
         label: "Star",
         description: "Toggle favorite for selected resource",
         contexts: &[Ctx::Resources, Ctx::Detail],
-        hotkey: true,
+        hotkey: false,
         palette: true,
         available: None,
     },
@@ -886,3 +979,38 @@ static COMMANDS: &[Cmd] = &[
         available: None,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        command_action,
+        Action,
+        Ctx,
+        COMMANDS,
+    };
+
+    #[test]
+    fn palette_rows_resolve_and_mutations_are_listed() {
+        for cmd in COMMANDS.iter().filter(|cmd| cmd.palette) {
+            assert!(command_action(cmd).is_some(), "{} / {}", cmd.key, cmd.label);
+        }
+        let actions: Vec<Action> = COMMANDS.iter().filter_map(command_action).collect();
+        for required in [
+            Action::Delete,
+            Action::Restart,
+            Action::Scale,
+            Action::Cordon,
+            Action::Drain,
+            Action::Trigger,
+            Action::Create,
+            Action::PfCancel,
+            Action::ApplyEdit,
+            Action::Pause,
+        ] {
+            assert!(actions.contains(&required), "{required:?} missing from palette");
+        }
+        assert!(COMMANDS
+            .iter()
+            .any(|cmd| { cmd.label == "Pause" && cmd.contexts.contains(&Ctx::Nav) && !cmd.hotkey }));
+    }
+}
