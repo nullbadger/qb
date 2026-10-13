@@ -15,7 +15,8 @@ kubeconfig — no kubectl dependency. Single binary, no external frontend, no re
 ```
 crates/qb/src/
   main.rs          Entry point, CLI routing
-  args.rs          CLI argument parsing (clap derive)
+  args.rs          CLI argument parsing (clap derive): version, man, autocomplete
+  reference.rs     Manpages, markdown, and shell completions generated from the CLI
   config.rs        Persistent config: profiles, favorites, saved port forwards, version checking.
                    Loads/saves ~/.config/qb/config.yaml.
   k8s/mod.rs       K8s API client, resource types, CRD discovery, pod resolution, log fetching,

@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
+clap-markdown = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 kube = { workspace = true }

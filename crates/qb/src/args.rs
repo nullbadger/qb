@@ -1,6 +1,10 @@
-use clap::{
-    Parser,
-    Subcommand,
+use {
+    clap::{
+        Parser,
+        Subcommand,
+        ValueEnum,
+    },
+    std::path::PathBuf,
 };
 
 #[derive(Parser)]
@@ -18,4 +22,28 @@ pub struct Cli {
 pub enum Command {
     /// Print version information
     Version,
+    /// Renders the manual.
+    Man {
+        /// Directory to write into.
+        #[arg(short = 'o', long = "out")]
+        out: PathBuf,
+        /// `manpages` or `markdown`.
+        #[arg(short = 'f', long = "format", value_enum)]
+        format: ManualFormat,
+    },
+    /// Renders shell completion scripts.
+    Autocomplete {
+        /// Directory to write into.
+        #[arg(short = 'o', long = "out")]
+        out: PathBuf,
+        /// bash, zsh, fish, elvish, or powershell.
+        #[arg(short = 's', long = "shell", value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ManualFormat {
+    Manpages,
+    Markdown,
 }
